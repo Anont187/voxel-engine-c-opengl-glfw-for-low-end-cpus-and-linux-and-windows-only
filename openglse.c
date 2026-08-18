@@ -203,7 +203,7 @@ bool firstMouseInput = true;
 bool isFlying = false;
 bool isGrounded = false;
 bool spaceKeyWasDown = false;
-bool toggleDof = false;
+bool toggleDof = true;
 
 unsigned int dofFbo = 0;
 unsigned int dofColorTex = 0;
@@ -1864,10 +1864,12 @@ int main(){
                         glBindVertexArray(chunk->mesh->vao);
 
                         glBindBuffer(GL_ARRAY_BUFFER, chunk->mesh->vbo);
-                        glBufferData(GL_ARRAY_BUFFER, chunk->cpuVertCount * sizeof(float), chunk->cpuVertices, GL_DYNAMIC_DRAW);
+                        glBufferData(GL_ARRAY_BUFFER, chunk->cpuVertCount * sizeof(float), NULL, GL_STATIC_DRAW);
+                        glBufferSubData(GL_ARRAY_BUFFER, 0, chunk->cpuVertCount * sizeof(float), chunk->cpuVertices);
 
                         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, chunk->mesh->ebo);
-                        glBufferData(GL_ELEMENT_ARRAY_BUFFER, chunk->cpuIndCount * sizeof(unsigned int), chunk->cpuIndices, GL_DYNAMIC_DRAW);
+                        glBufferData(GL_ELEMENT_ARRAY_BUFFER, chunk->cpuIndCount * sizeof(unsigned int), NULL, GL_STATIC_DRAW);
+                        glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, 0, chunk->cpuIndCount * sizeof(unsigned int), chunk->cpuIndices);
 
                         glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 7 * sizeof(float), (void*)0);
                         glEnableVertexAttribArray(0);
