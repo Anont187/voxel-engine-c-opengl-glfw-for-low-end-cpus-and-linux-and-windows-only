@@ -25,6 +25,8 @@ uniform mat4 view;
 uniform mat4 projection;
 
 out vec2 uvPass;
+out vec3 worldPos;
+
 flat out int layerPass;
 flat out int faceIdPass;
 
@@ -36,6 +38,7 @@ void main() {
     if (faceIdPass == 6 || faceIdPass == 9) {
         gl_Position = vec4(aPos.xy, -1.0, 1.0);
     } else {
+        worldPos = aPos;
         gl_Position = projection * view * model * vec4(aPos, 1.0);
     }
 }
@@ -45,6 +48,7 @@ const char* fragmentSrc = R"(
 #version 430
 
 in vec2 uvPass;
+in vec3 worldPos;
 
 flat in int layerPass;
 flat in int faceIdPass;
@@ -53,6 +57,7 @@ uniform sampler2DArray texAtlas;
 uniform sampler2D dofColorTex;
 uniform sampler2D dofDepthTex;
 uniform vec3 sunDir;
+uniform vec3 camPos;
 
 uniform float dofNear;
 uniform float dofFar;
@@ -69,6 +74,17 @@ const vec3 faceNorms[6] = vec3[6](
 
 out vec4 fragColor;
 
+vec3 applyFog(vec3 baseColor, vec3 fragWorldPos) {
+    float dist = distance(camPos, fragWorldPos);
+    float fogStart = 100.0;
+    float fogEnd = 180.0;
+    float fogAmount = clamp((dist - fogStart) / (fogEnd - fogStart), 0.0, 1.0);
+
+    vec3 fogColor = vec3(0.2, 0.3, 0.3);
+
+    return mix(baseColor, fogColor, fogAmount);
+}
+
 void main() {
     if (faceIdPass == 6) {
         fragColor = vec4(1.0, 1.0, 1.0, 0.9);
@@ -76,21 +92,29 @@ void main() {
     }
 
     if (faceIdPass == 7) {
-        vec3 grassCol = vec3(0.42, 0.68, 0.30) * vec3(0.55, 0.50, 0.45);
-        fragColor = vec4(grassCol, 1.0);
+        vec3 grassCol = vec3(0.168f, 0.3686f, 0.0471f);
+        float diff = max(dot(vec3(0.0, 1.0, 0.0), sunDir), 0.0);
+        float lighting = 0.35 + 0.65 * diff;
+        fragColor = vec4(applyFog(grassCol * lighting, worldPos), 1.0);
         return;
     } 
 
     if (faceIdPass == 8) {
-        fragColor = vec4(0.35, 0.22, 0.12, 1.0);
+        vec3 dirtCol = vec3(0.4667f, 0.3059f, 0.0902f) * 0.7;
+
+        fragColor = vec4(applyFog(dirtCol, worldPos), 1.0);
         return;
     }
 
     if (faceIdPass == 9) {
+        float centerDepthRaw = texture(dofDepthTex, vec2(0.5, 0.5)).r;
+        float centerNdc = centerDepthRaw * 2.0 - 1.0;
+        float centerLinear = (2.0 * dofNear * dofFar) / (dofFar + dofNear - centerNdc * (dofFar - dofNear));
+
         float depthRaw = texture(dofDepthTex, uvPass).r;
         float ndc = depthRaw * 2.0 - 1.0;
         float linearDepth = (2.0 * dofNear * dofFar) / (dofFar + dofNear - ndc * (dofFar - dofNear));
-        float blurAmount = clamp(abs(linearDepth - dofFocusDist) / dofFocusDist, 0.0, 1.0);
+        float coc = clamp(abs(linearDepth - centerLinear) / dofFocusDist, 0.0, 1.0);
 
         vec2 texel = 1.0 / vec2(textureSize(dofColorTex, 0));
         vec4 sharp = texture(dofColorTex, uvPass);
@@ -103,11 +127,11 @@ void main() {
 
         vec4 blurred = sharp;
         for (int i = 0; i < 12; i++) {
-            blurred += texture(dofColorTex, uvPass + offsets[i] * texel * 3.0 * blurAmount);
+            blurred += texture(dofColorTex, uvPass + offsets[i] * texel * 3.0 * coc);
         }
         blurred /= 13.0;
 
-        fragColor = mix(sharp, blurred, blurAmount);
+        fragColor = mix(sharp, blurred, coc);
         return;
     }
 
@@ -124,7 +148,7 @@ void main() {
 
     texColor.rgb *= lighting;
 
-    fragColor = texColor;
+    fragColor = vec4(applyFog(texColor.rgb, worldPos), texColor.a);
 }
 )";
 
@@ -134,6 +158,8 @@ void main() {
 #define lodCellSize 8
 #define lodRadius 6
 #define maxTerrainHeight 125
+#define noiseStep 4
+#define noiseGridSize (chunkSize / noiseStep + 1)
 
 int width = 640;
 int height = 480;
@@ -177,7 +203,7 @@ bool firstMouseInput = true;
 bool isFlying = false;
 bool isGrounded = false;
 bool spaceKeyWasDown = false;
-bool toggleDof = true;
+bool toggleDof = false;
 
 unsigned int dofFbo = 0;
 unsigned int dofColorTex = 0;
@@ -319,6 +345,35 @@ float getTerrainHeight(float wx, float wz) {
     return baseheight + detail;
 }
 
+void buildCoarseHeightGrid(int cx, int cz, float grid[noiseGridSize][noiseGridSize]) {
+    for (int gz = 0; gz < noiseGridSize; gz++) {
+        for (int gx = 0; gx < noiseGridSize; gx++) {
+            float wx = (float)(cx * chunkSize + gx * noiseStep);
+            float wz = (float)(cz * chunkSize + gz * noiseStep);
+
+            grid[gx][gz] = getTerrainHeight(wx, wz);
+        }
+    }
+}
+
+float sampleUpsampledHeight(float grid[noiseGridSize][noiseGridSize], int localX, int localZ) {
+    int gx0 = localX / noiseStep;
+    int gz0 = localZ / noiseStep;
+    int gx1 = gx0 + 1;
+    int gz1 = gz0 + 1;
+
+    float fx = (float)(localX % noiseStep) / (float)noiseStep;
+    float fz = (float)(localZ % noiseStep) / (float)noiseStep;
+    float h00 = grid[gx0][gz0];
+    float h10 = grid[gx1][gz0];
+    float h01 = grid[gx0][gz1];
+    float h11 = grid[gx1][gz1];
+    float hx0 = h00 + (h10 - h00) * fx;
+    float hx1 = h01 + (h11 - h01) * fx;
+
+    return hx0 + (hx1 - hx0) * fz;
+}
+
 void exactFrustumPlanes(mat4 vp, plane planes[6]) {
     planes[0] = (plane){ vp[0][3]+vp[0][0], vp[1][3]+vp[1][0], vp[2][3]+vp[2][0], vp[3][3]+vp[3][0] }; // left
     planes[1] = (plane){ vp[0][3]-vp[0][0], vp[1][3]-vp[1][0], vp[2][3]-vp[2][0], vp[3][3]-vp[3][0] }; // right
@@ -361,8 +416,8 @@ void buildLodSize(lodTileEntry* entry) {
             float p11[3] = { wx1, h, wz1 };
             float p01[3] = { wx0, h, wz1 };
 
-            float* topTri1[3] = { p00, p10, p11 };
-            float* topTri2[3] = { p00, p11, p01 };
+            float* topTri1[3] = { p00, p11, p10 };
+            float* topTri2[3] = { p00, p01, p11 };
 
             for (int t = 0; t < 2; t++) {
                 float** tri = (t == 0) ? topTri1 : topTri2;
@@ -500,12 +555,33 @@ chunks* getOrCreateChunk(int cx, int cy, int cz) {
 
     memset(entry->chunk.voxels, 0, sizeof(entry->chunk.voxels));
 
+    int chunkMinY = cy * chunkSize;
+    int chunkMaxY = chunkMinY + chunkSize - 1;
+
+    if (chunkMinY > (int)(maxTerrainHeight + 12.0f)) {
+        entry->chunk.isGenerated = 1;
+        HASH_ADD_STR(loadedChunks, key, entry);
+        LeaveCriticalSection(&chunkLock);
+        return &entry->chunk;
+    }
+
+    if (chunkMaxY < -12) {
+        memset(entry->chunk.voxels, 1, sizeof(entry->chunk.voxels));
+        entry->chunk.isGenerated = 1;
+        HASH_ADD_STR(loadedChunks, key, entry);
+        LeaveCriticalSection(&chunkLock);
+        return &entry->chunk;
+    }
+
+    float heightGrid[noiseGridSize][noiseGridSize];
+    buildCoarseHeightGrid(cx, cz, heightGrid);
+
     for (int z = 0; z < chunkSize; z++) {
         for (int x = 0; x < chunkSize; x++) {
-            int worldX = cx * chunkSize + x;
-            int worldZ = cz * chunkSize + z;
+            // int worldX = cx * chunkSize + x;
+            // int worldZ = cz * chunkSize + z;
 
-            int terrainHeight = (int)getTerrainHeight((float)worldX, (float)worldZ);
+            int terrainHeight = (int)sampleUpsampledHeight(heightGrid, x, z);
 
             for (int y = 0; y < chunkSize; y++) {
                 int worldY = cy * chunkSize + y;
@@ -1618,6 +1694,7 @@ int main(){
     GLint dofNearLoc = glGetUniformLocation(shaderProgram, "dofNear");
     GLint dofFarLoc = glGetUniformLocation(shaderProgram, "dofFar");
     GLint dofFocusDistLoc = glGetUniformLocation(shaderProgram, "dofFocusDist");
+    GLint camPosLoc = glGetUniformLocation(shaderProgram, "camPos");
 
     float dofQuadVerts[6 * 7] = {
         -1.0f, -1.0f, 0.0f,  0.0f, 0.0f,  0.0f, 9.0f,
@@ -1750,6 +1827,8 @@ int main(){
 
         glUniform3fv(sunDirLoc, 1, sunDir);
 
+        glUniform3f(camPosLoc, camX, camY, camZ);
+
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D_ARRAY, blockTextures);
         glUniform1i(texAtlasLoc, 0);
@@ -1828,7 +1907,7 @@ int main(){
             int camTileX = (int)floorf(camX / (float)lodTileSize);
             int camTileZ = (int)floorf(camZ / (float)lodTileSize);
 
-            int realRadInTiles = (renderRad * chunkSize) / lodTileSize + 1;
+            int realRadInTiles = (renderRad * chunkSize) / lodTileSize;
             int builtThisFrame = 0;
 
             for (int tx = camTileX - lodRadius; tx <= camTileX + lodRadius; tx++) {
@@ -1883,10 +1962,12 @@ int main(){
             glUniform1i(dofColorTexLoc, 1);
 
             glActiveTexture(GL_TEXTURE2);
+            glBindTexture(GL_TEXTURE_2D, dofDepthTex);
             glUniform1i(dofDepthTexLoc, 2);
-            glUniform1i(dofNearLoc, 0.1f);
-            glUniform1i(dofFarLoc, 800.0f);
-            glUniform1i(dofFocusDistLoc, 40.0f);
+
+            glUniform1f(dofNearLoc, 0.1f);
+            glUniform1f(dofFarLoc, 800.0f);
+            glUniform1f(dofFocusDistLoc, 25.0f);
 
             glBindVertexArray(dofVao);
             glDrawArrays(GL_TRIANGLES, 0, 6);
