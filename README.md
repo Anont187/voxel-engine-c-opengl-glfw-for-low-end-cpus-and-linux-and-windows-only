@@ -1,8 +1,8 @@
-# voxel-engine-c-opengl-glfw-for-lowend-cpus-and-windows-only
+# voxel-engine-c-opengl-glfw-for-low-end-cpus-and-windows-only
 This is a voxel engine with optimizations. For windows only.
 
-This is an extremely optimized voxel engine, more optimizations coming soon.
-It also squeezes the performance out of lowend pc's.
+This is an optimized voxel engine, more optimizations coming soon.
+It also squeezes the performance out of low-end pc's.
 
 ***this is based on a CELERON N3050 with 2GB of storage. May not apply to other users.***
 
