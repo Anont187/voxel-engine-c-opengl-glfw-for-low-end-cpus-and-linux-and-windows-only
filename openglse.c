@@ -7,6 +7,7 @@
 #include <windows.h>
 #include <psapi.h> 
 #include <string.h>
+#include <stdint.h>
 #include "cglm/cglm.h"
 #include "uthash.h"
 #define STB_IMAGE_IMPLEMENTATION
@@ -72,6 +73,13 @@ const vec3 faceNorms[6] = vec3[6](
     vec3(0.0, 0.0, 1.0)
 );
 
+const vec3 sideNorms[4] = vec3[4](
+    vec3(1.0, 0.0, -1.0),
+    vec3(0.0, 0.0, 1.0),
+    vec3(-1.0, 0.0, 0.0),
+    vec3(1.0, 0.0, 0.0)
+);
+
 out vec4 fragColor;
 
 vec3 applyFog(vec3 baseColor, vec3 fragWorldPos) {
@@ -101,8 +109,12 @@ void main() {
 
     if (faceIdPass == 8) {
         vec3 dirtCol = vec3(0.4667f, 0.3059f, 0.0902f) * 0.7;
+        vec3 normal = sideNorms[layerPass];
 
-        fragColor = vec4(applyFog(dirtCol, worldPos), 1.0);
+        float diff = max(dot(normal, sunDir), 0.0);
+        float lighting = 0.35 + 0.65 * diff;
+
+        fragColor = vec4(applyFog(dirtCol * lighting, worldPos), 1.0);
         return;
     }
 
@@ -135,6 +147,11 @@ void main() {
         return;
     }
 
+    if (faceIdPass == 10) {
+        fragColor = vec4(0.0, 0.0, 0.0, 1.0);
+        return;
+    }
+
     vec4 texColor = texture(texAtlas, vec3(uvPass, layerPass));
 
     if (layerPass == 1) {
@@ -155,11 +172,14 @@ void main() {
 #define chunkSize 32
 #define renderRad 2
 #define lodTileSize 64
-#define lodCellSize 8
+#define lodCellSize 4
 #define lodRadius 6
 #define maxTerrainHeight 125
 #define noiseStep 4
 #define noiseGridSize (chunkSize / noiseStep + 1)
+#define maxDrawCommands 4096
+#define masterVboSize (32 * 1024 * 1024 * sizeof(float))
+#define masterEboSize (16 * 1024 * 1024 * sizeof(unsigned int))
 
 int width = 640;
 int height = 480;
@@ -167,6 +187,14 @@ int goWireframe = 0;
 int activeIdxCount = 0;
 int dofFboWidth = 0;
 int dofFboHeight = 0;
+int winX;
+int winY;
+int winWidth;
+int winHeight;
+int highlightX;
+int highlightY;
+int highlightZ;
+int globalCommandCount = 0;
 
 float pcamSpeed = 4.3f;
 float rotSpeed = 60.0f;
@@ -202,12 +230,23 @@ bool isCameraRotateble = false;
 bool firstMouseInput = true;
 bool isFlying = false;
 bool isGrounded = false;
+bool isFullscreen = false;
 bool spaceKeyWasDown = false;
-bool toggleDof = true;
+bool hasBlockHighlight = false;
+bool toggleDof = false;
 
 unsigned int dofFbo = 0;
 unsigned int dofColorTex = 0;
 unsigned int dofDepthTex = 0;
+unsigned int highlightVao;
+unsigned int highlightVbo;
+unsigned int masterVao = 0;
+unsigned int masterVbo = 0;
+unsigned int masterEbo = 0;
+unsigned int masterIndirectBuffer = 0;
+
+size_t masterVboOffsetBytes = 0;
+size_t masterEboOffsetElements = 0;
 
 const float gravity = 28.0f;
 const float jumpSpeed = 8.0f;
@@ -218,10 +257,17 @@ const float flySpeedMax = 10.0f;
 const double doubleTapWindow = 0.3f;
 
 typedef struct {
-    unsigned int vao;
-    unsigned int vbo;
-    unsigned int ebo;
+    GLuint count;
+    GLuint instanceCount;
+    GLuint firstIndex;
+    GLuint baseVertex;
+    GLuint baseInstance;
+} drawElementsIndirectCommand;
+
+typedef struct {
     int indexCount;
+    int firstIndex;
+    int baseVertex;
 } meshs;
 
 typedef struct {
@@ -235,7 +281,7 @@ typedef struct {
 } chunkCoord;
 
 typedef struct {
-    bool voxels[chunkSize][chunkSize][chunkSize];
+    uint32_t voxels[chunkSize][chunkSize];
     meshs* mesh;
     int isDirty;
     int isGenerated;
@@ -265,6 +311,7 @@ typedef struct {
 typedef struct {
     unsigned int vao, vbo;
     int vertCount;
+    int cellSize;
     bool built;
 } lodTile;
 
@@ -277,6 +324,8 @@ typedef struct {
 
 lodTileEntry* loadedLodTiles = NULL;
 chunkEntry* loadedChunks = NULL;
+
+drawElementsIndirectCommand hostCommands[maxDrawCommands];
 
 const char* stringed = "basic window";
 const char* texturePath[] = { "textures/dirt.png", "textures/grass.png" };
@@ -391,26 +440,53 @@ void exactFrustumPlanes(mat4 vp, plane planes[6]) {
     }
 }
 
+int cellSizeForTileDist(int distTiles) {
+    if (distTiles <= 3) return 4;
+    if (distTiles <= 6) return 8;
+    return 16;
+}
+
 void buildLodSize(lodTileEntry* entry) {
-    int cellsPerSide = lodTileSize / lodCellSize;
-    int maxVerts = cellsPerSide * cellsPerSide * 5 * 6 * 7;
+    int cellsPerSide = lodTileSize / entry->tile.cellSize;
+    int maxVerts = cellsPerSide * cellsPerSide * (2*3 + 8*3) * 7;
     int vc = 0;
 
     float* verts = malloc(maxVerts * sizeof(float));
-    float maxExpectedHeight = maxTerrainHeight;
-    float floorY = -30.0f;
+    if (!verts) return;
+
+    float grid[noiseGridSize][noiseGridSize];
+
+    buildCoarseHeightGrid(entry->tx * (lodTileSize / chunkSize), entry->tz * (lodTileSize / chunkSize), grid);
+
+    float tileOrginX = entry->tx * (float)lodTileSize;
+    float tileOrginZ = entry->tz * (float)lodTileSize;
+    float minHeight = 1e9f;
+    float cellHeights[cellsPerSide][cellsPerSide];
 
     for (int cx = 0; cx < cellsPerSide; cx++) {
         for (int cz = 0; cz < cellsPerSide; cz++) {
-            float wx0 = entry->tx * (float)lodTileSize + cx * lodCellSize;
-            float wz0 = entry->tz * (float)lodTileSize + cz * lodCellSize;
+            float wx0 = tileOrginX + cx * lodCellSize;
+            float wz0 = tileOrginZ + cz * lodCellSize;
             float wx1 = wx0 + lodCellSize;
             float wz1 = wz0 + lodCellSize;
+            float localX = (wx0 + wx1) * 0.5f - tileOrginX;
+            float localZ = (wz0 + wz1) * 0.5f - tileOrginZ;
+            float h = sampleUpsampledHeight(grid, (int)localX, (int)localZ);
 
-            float h = getTerrainHeight((wx0 + wx1) * 0.5f, (wz0 + wz1) * 0.5f);
+            cellHeights[cx][cz] = h;
+            if (h < minHeight) minHeight = h;
+        }
+    }
 
-            float topColorU = h / maxExpectedHeight;
+    float floorY = minHeight - 1.0f;
 
+    for (int cx = 0; cx < cellsPerSide; cx++) {
+        for (int cz = 0; cz < cellsPerSide; cz++) {
+            float h = cellHeights[cx][cz];
+            float wx0 = tileOrginX + cx * lodCellSize;
+            float wz0 = tileOrginZ + cz * lodCellSize;
+            float wx1 = wx0 + lodCellSize;
+            float wz1 = wz0 + lodCellSize;
             float p00[3] = { wx0, h, wz0 };
             float p10[3] = { wx1, h, wz0 };
             float p11[3] = { wx1, h, wz1 };
@@ -425,39 +501,42 @@ void buildLodSize(lodTileEntry* entry) {
                     verts[vc++] = tri[i][0];
                     verts[vc++] = tri[i][1];
                     verts[vc++] = tri[i][2];
-                    verts[vc++] = topColorU;
-                    verts[vc++] = 0.0f;
-                    verts[vc++] = 0.0f;
-                    verts[vc++] = 7.0f;
+                    verts[vc++] = (tri[i][0] - tileOrginX) / 4.0f;
+                    verts[vc++] = (tri[i][2] - tileOrginZ) / 4.0f;
+                    verts[vc++] = 1.0f;
+                    verts[vc++] = 3.0f;
                 }
             }
 
-            float sideCorners[4][4][3] = {
-                { {wx0,h,wz0}, {wx1,h,wz0}, {wx1,floorY,wz0}, {wx0,floorY,wz0} }, // front
-                { {wx1,h,wz1}, {wx0,h,wz1}, {wx0,floorY,wz1}, {wx1,floorY,wz1} }, // back
-                { {wx0,h,wz1}, {wx0,h,wz0}, {wx0,floorY,wz0}, {wx0,floorY,wz1} }, // left
-                { {wx1,h,wz0}, {wx1,h,wz1}, {wx1,floorY,wz1}, {wx1,floorY,wz0} }  // right
+            float b00[3] = { wx0, floorY, wz0 };
+            float b10[3] = { wx1, floorY, wz0 };
+            float b11[3] = { wx1, floorY, wz1 };
+            float b01[3] = { wx0, floorY, wz1 };
+
+            struct { float* tri[3]; int faceId; } sides[8] = {
+                { {p00, p10, b10}, 4 },
+                { {p00, b10, b00}, 4 },
+                { {p11, p01, b01}, 5 },
+                { {p11, b01, b11}, 5 },
+                { {p01, p00, b00}, 6 },
+                { {p01, b00, b01}, 6 },
+                { {p10, p11, b11}, 7 },
+                { {p10, b11, b10}, 7 }
             };
 
-            for (int s = 0; s < 4; s++) {
-                float* q0 = sideCorners[s][0];
-                float* q1 = sideCorners[s][1];
-                float* q2 = sideCorners[s][2];
-                float* q3 = sideCorners[s][3];
-                float* sideTri1[3] = { q0, q1, q2 };
-                float* sideTri2[3] = { q0, q2, q3 };
+            for (int s = 0; s < 8; s++) {
+                float** tri = sides[s].tri;
 
-                for (int t = 0; t < 2; t++) {
-                    float** tri = (t == 0) ? sideTri1 : sideTri2;
-                    for (int i = 0; i < 3; i++) {
-                        verts[vc++] = tri[i][0];
-                        verts[vc++] = tri[i][1];
-                        verts[vc++] = tri[i][2];
-                        verts[vc++] = 0.0f;
-                        verts[vc++] = 0.0f;
-                        verts[vc++] = 0.0f;
-                        verts[vc++] = 8.0f;
-                    }
+                int fid = sides[s].faceId;
+
+                for (int i = 0; i < 3; i++) {
+                    verts[vc++] = tri[i][0];
+                    verts[vc++] = tri[i][1];
+                    verts[vc++] = tri[i][2];
+                    verts[vc++] = (tri[i][0] - tileOrginX) / 4.0f;
+                    verts[vc++] = (tri[i][1] - floorY) / (maxTerrainHeight - floorY);
+                    verts[vc++] = 0.0f;
+                    verts[vc++] = (float)fid;
                 }
             }
         }
@@ -500,6 +579,7 @@ lodTileEntry* getOrCreateLodTile(int tx, int tz) {
         entry->tx = tx;
         entry->tz = tz;
         entry->tile.built = false;
+        entry->tile.cellSize = 0;
         HASH_ADD(hh, loadedLodTiles, key, sizeof(long long), entry);
     }
     return entry;
@@ -566,7 +646,7 @@ chunks* getOrCreateChunk(int cx, int cy, int cz) {
     }
 
     if (chunkMaxY < -12) {
-        memset(entry->chunk.voxels, 1, sizeof(entry->chunk.voxels));
+        memset(entry->chunk.voxels, 0xFF, sizeof(entry->chunk.voxels));
         entry->chunk.isGenerated = 1;
         HASH_ADD_STR(loadedChunks, key, entry);
         LeaveCriticalSection(&chunkLock);
@@ -575,6 +655,8 @@ chunks* getOrCreateChunk(int cx, int cy, int cz) {
 
     float heightGrid[noiseGridSize][noiseGridSize];
     buildCoarseHeightGrid(cx, cz, heightGrid);
+
+    memset(entry->chunk.voxels, 0, sizeof(entry->chunk.voxels));
 
     for (int z = 0; z < chunkSize; z++) {
         for (int x = 0; x < chunkSize; x++) {
@@ -587,7 +669,7 @@ chunks* getOrCreateChunk(int cx, int cy, int cz) {
                 int worldY = cy * chunkSize + y;
 
                 if (worldY <= terrainHeight) {
-                    entry->chunk.voxels[x][y][z] = true;
+                    entry->chunk.voxels[y][z] |= (1U << x);
                 }
             }
         }
@@ -626,7 +708,7 @@ bool isSolidAtWorld(int x, int y, int z) {
     chunks* chunk = getChunkSilent(cx, cy, cz);
     if (!chunk || !chunk->isGenerated) return false;
 
-    return chunk->voxels[localX][localY][localZ];
+    return (chunk->voxels[localY][localZ] & (1U << localX)) != 0;
 }
 
 bool raycastVoxel(float ox, float oy, float oz, float dx, float dy, float dz, float maxDist, int* hitX, int* hitY, int* hitZ, int* placeX, int* placeY, int* placeZ) {
@@ -704,7 +786,7 @@ bool checkPlayerCollision(float px, float feetY, float pz) {
     return false;
 }
 
-float tryMove(float dx, float dy, float dz) {
+void tryMove(float dx, float dy, float dz) {
     float feetY = camY - eyeHeight;
 
     if (dx != 0.0f) {
@@ -740,10 +822,8 @@ void unloadDistantChunks(int camChunkX, int camChunkY, int camChunkZ, int keepRa
             if (entry->chunk.isMeshing) continue;
 
             if (entry->chunk.mesh != NULL) {
-                glDeleteBuffers(1, &entry->chunk.mesh->vbo);
-                glDeleteBuffers(1, &entry->chunk.mesh->ebo);
-                glDeleteVertexArrays(1, &entry->chunk.mesh->vao);
                 free(entry->chunk.mesh);
+                entry->chunk.mesh = NULL;
             }
 
             if (entry->chunk.cpuVertices) free(entry->chunk.cpuVertices);
@@ -755,6 +835,24 @@ void unloadDistantChunks(int camChunkX, int camChunkY, int camChunkZ, int keepRa
     }
 
     LeaveCriticalSection(&chunkLock);
+}
+
+void unloadDistantLodChunks(int camTileX, int camTileZ, int keepRadius) {
+    lodTileEntry *entry, *tmp;
+    HASH_ITER(hh, loadedLodTiles, entry, tmp) {
+        int dTx = entry->tx - camTileX;
+        int dTz = entry->tz - camTileZ;
+
+        if (abs(dTx) > keepRadius || abs(dTz) > keepRadius) {
+            if (entry->tile.built) {
+                glDeleteBuffers(1, &entry->tile.vbo);
+                glDeleteVertexArrays(1, &entry->tile.vao);
+            }
+
+            HASH_DEL(loadedLodTiles, entry);
+            free(entry);
+        }
+    }
 }
 
 DWORD WINAPI backgroundChunkWorker(LPVOID lpParam) {
@@ -796,17 +894,20 @@ DWORD WINAPI backgroundChunkWorker(LPVOID lpParam) {
         }
 
         if (!targetChunk->isGenerated) {
+            float fallbackHeightGrid[noiseGridSize][noiseGridSize];
+            buildCoarseHeightGrid(tCx, tCz, fallbackHeightGrid);
+
             for (int z = 0; z < chunkSize; z++) {
                 for (int x = 0; x < chunkSize; x++) {
                     int worldX = tCx * chunkSize + x;
                     int worldZ = tCz * chunkSize + z;
-                    float terrainHeight = getTerrainHeight((float)worldX, (float)worldZ);
+                    float terrainHeight = (int)sampleUpsampledHeight(fallbackHeightGrid, x, z);
 
                     for (int y = 0; y < chunkSize; y++) {
                         int worldY = tCy * chunkSize + y;
 
                         if (worldY <= terrainHeight) {
-                            targetChunk->voxels[x][y][z] = true;
+                            targetChunk->voxels[y][z] |= (1U << x);
                         }
                     }
                 }
@@ -848,7 +949,7 @@ DWORD WINAPI backgroundChunkWorker(LPVOID lpParam) {
                         int tLy = (ly + chunkSize) % chunkSize;
                         int tLz = (lz + chunkSize) % chunkSize;
 
-                        blocks[(lx + 1) * dim * dim + (ly + 1) * dim + (lz + 1)] = target->voxels[tLx][tLy][tLz];
+                        blocks[(lx + 1) * dim * dim + (ly + 1) * dim + (lz + 1)] = (target->voxels[tLy][tLz] & (1U << tLx)) != 0;
                     }
                 }
             }
@@ -1149,6 +1250,24 @@ void scrollCallback(GLFWwindow* window, double xoffset, double yoffset) {
     if (cfov > 90.0f) cfov = 90.0f;
 }
 
+void keyCallback(GLFWwindow* window, int key, int scancodde, int action, int mods) {
+    if (key == GLFW_KEY_F11 && action == GLFW_PRESS) {
+        isFullscreen = !isFullscreen;
+
+        if (isFullscreen) {
+            glfwGetWindowPos(window, &winX, &winY);
+            glfwGetWindowSize(window, &winWidth, &winHeight);
+
+            GLFWmonitor* monitor = glfwGetPrimaryMonitor();
+            const GLFWvidmode* mode = glfwGetVideoMode(monitor);
+
+            glfwSetWindowMonitor(window, monitor, 0, 0, mode->width, mode->height, mode->refreshRate);
+        } else {
+            glfwSetWindowMonitor(window, NULL, winX, winY, winWidth, winHeight, 0);
+        }
+    } 
+}
+
 int memUsage() {
     PROCESS_MEMORY_COUNTERS pmc;
     if (GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&pmc, sizeof(pmc))) {
@@ -1184,11 +1303,12 @@ void updFpsCounter(GLFWwindow* window, double time, size_t ramSize, float camX, 
     fc++;
 }
 
-void drawWorldMesh(meshs* m) {
-    if (m == NULL || m->indexCount == 0) return;
+void drawWorldMesh(int commandCount) {
+    if (commandCount == 0) return;
 
-    glBindVertexArray(m->vao);
-    glDrawElements(GL_TRIANGLES, m->indexCount, GL_UNSIGNED_INT, 0);
+    glBindVertexArray(masterVao);
+    glBindBuffer(GL_DRAW_INDIRECT_BUFFER, masterIndirectBuffer);
+    glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT, (void*)0, commandCount, 0);
     glBindVertexArray(0);
 }
 
@@ -1207,7 +1327,8 @@ void toggleVoxel(int x, int y, int z) {
 
     EnterCriticalSection(&chunkLock);
     chunks* chunk = getOrCreateChunk(cx, cy, cz);
-    chunk->voxels[localX][localY][localZ] = !chunk->voxels[localX][localY][localZ];
+    if (!chunk) return;
+    chunk->voxels[localY][localZ] ^= (1U << localX);
     chunk->isDirty = 1;
     LeaveCriticalSection(&chunkLock);
 }
@@ -1306,6 +1427,24 @@ void processInput(GLFWwindow* window, float deltaTime) {
             } else if (currentPeriodPress && !periodWasPressed) {
                 toggleVoxel(hitX, hitY, hitZ);
             }
+        }
+    }
+
+    {
+        float radYaw = glm_rad(camYaw);
+        float radPitch = glm_rad(camPitch);
+        float hdX = cosf(radPitch) * cosf(radYaw);
+        float hdY = sinf(radPitch);
+        float hdZ = cosf(radPitch) * sinf(radYaw);
+
+        int hx, hy, hz, px, py, pz;
+
+        hasBlockHighlight = raycastVoxel(camX, camY, camZ, hdX, hdY, hdZ, 6.0f, &hx, &hy, &hz, &px, &py, &pz);
+
+        if (hasBlockHighlight) {
+            highlightX = hx;
+            highlightY = hy;
+            highlightZ = hz;
         }
     }
 
@@ -1483,8 +1622,13 @@ void placeBlock(int x, int y, int z, bool value) {
 
     EnterCriticalSection(&chunkLock);
     chunks* chunk = getOrCreateChunk(cx, cy, cz);
+    if (!chunk) return;
 
-    chunk->voxels[localX][localY][localZ] = value;
+    if (value) {
+        chunk->voxels[localY][localZ] |= (1U << localX);
+    } else {
+        chunk->voxels[localY][localZ] &= ~(1U << localX);
+    }
 
     chunk->isDirty = 1;
     LeaveCriticalSection(&chunkLock);
@@ -1560,6 +1704,7 @@ int main(){
 
     glfwSetFramebufferSizeCallback(window, framebufferSizeCallback);
     glfwSetScrollCallback(window, scrollCallback);
+    glfwSetKeyCallback(window, keyCallback);
 
     int success;
     char infolog[512];
@@ -1599,6 +1744,36 @@ int main(){
     glDeleteShader(fragmentShader);
 
     double time = 0;
+
+    glGenVertexArrays(1, &masterVao);
+    glGenBuffers(1, &masterVbo);
+    glGenBuffers(1, &masterEbo);
+    glGenBuffers(1, &masterIndirectBuffer);
+
+    glBindVertexArray(masterVao);
+
+    glBindBuffer(GL_ARRAY_BUFFER, masterVbo);
+    glBufferData(GL_ARRAY_BUFFER, masterVboSize, NULL, GL_DYNAMIC_DRAW);
+
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, masterEbo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, masterEboSize, NULL, GL_DYNAMIC_DRAW);
+
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 7 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 7 * sizeof(float), (void*)(3 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+
+    glVertexAttribPointer(2, 1, GL_FLOAT, GL_FALSE, 7 * sizeof(float), (void*)(5 * sizeof(float)));
+    glEnableVertexAttribArray(2);
+
+    glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, 7 * sizeof(float), (void*)(6 * sizeof(float)));
+    glEnableVertexAttribArray(3);
+
+    glBindBuffer(GL_DRAW_INDIRECT_BUFFER, masterIndirectBuffer);
+    glBufferData(GL_DRAW_INDIRECT_BUFFER, maxDrawCommands * sizeof(drawElementsIndirectCommand), NULL, GL_DYNAMIC_DRAW);
+
+    glBindVertexArray(0);
 
     // float vertices[] = {
     //     // pos, col
@@ -1727,6 +1902,28 @@ int main(){
 
     glBindVertexArray(0);
 
+    glGenVertexArrays(1, &highlightVao);
+    glGenBuffers(1, &highlightVbo);
+
+    glBindVertexArray(highlightVao);
+
+    glBindBuffer(GL_ARRAY_BUFFER, highlightVbo);
+    glBufferData(GL_ARRAY_BUFFER, 24 * 7 * sizeof(float), NULL, GL_DYNAMIC_DRAW);
+
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 7 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 7 * sizeof(float), (void*)(3 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+
+    glVertexAttribPointer(2, 1, GL_FLOAT, GL_FALSE, 7 * sizeof(float), (void*)(5 * sizeof(float)));
+    glEnableVertexAttribArray(2);
+
+    glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, 7 * sizeof(float), (void*)(6 * sizeof(float)));
+    glEnableVertexAttribArray(3);
+
+    glBindVertexArray(0);
+
     int workChunks = 64;
 
     double lastTime = 0;
@@ -1833,6 +2030,10 @@ int main(){
         glBindTexture(GL_TEXTURE_2D_ARRAY, blockTextures);
         glUniform1i(texAtlasLoc, 0);
 
+        globalCommandCount = 0;
+
+        glBindVertexArray(masterVao);
+
         for (int cx = camChunkX - renderRad; cx <= camChunkX + renderRad; cx++) {
             for (int cy = camChunkY - renderRad; cy <= camChunkY + renderRad; cy++) {
                 for (int cz = camChunkZ - renderRad; cz <= camChunkZ + renderRad; cz++) { 
@@ -1845,47 +2046,39 @@ int main(){
                     }
 
                     chunks* chunk = getOrCreateChunk(cx, cy, cz);
+                    if (!chunk) continue;
 
                     EnterCriticalSection(&chunkLock);
                     if (chunk->isMeshReady) {
                         if (chunk->mesh == NULL) {
                             chunk->mesh = malloc(sizeof(meshs));
-
-                            if (chunk->mesh == NULL) {
-                                LeaveCriticalSection(&chunkLock);
-                                continue;
-                            }
-
-                            glGenVertexArrays(1, &chunk->mesh->vao);
-                            glGenBuffers(1, &chunk->mesh->vbo);
-                            glGenBuffers(1, &chunk->mesh->ebo);
                         }
 
-                        glBindVertexArray(chunk->mesh->vao);
+                        if (chunk->mesh != NULL) {
+                            int incomingVertCount = chunk->cpuVertCount;
+                            int incomingIndCount = chunk->cpuIndCount;
+                            
+                            size_t vertSizeBytes = incomingVertCount * sizeof(float);
+                            size_t indSizeBytes = incomingIndCount * sizeof(unsigned int);
 
-                        glBindBuffer(GL_ARRAY_BUFFER, chunk->mesh->vbo);
-                        glBufferData(GL_ARRAY_BUFFER, chunk->cpuVertCount * sizeof(float), NULL, GL_STATIC_DRAW);
-                        glBufferSubData(GL_ARRAY_BUFFER, 0, chunk->cpuVertCount * sizeof(float), chunk->cpuVertices);
+                            // if (masterVboOffsetBytes + vertSizeBytes >= masterVboSize || (masterEboOffsetElements + incomingIndCount) * sizeof(unsigned int) >= masterEboSize) {
+                            //     masterVboOffsetBytes = 0;
+                            //     masterEboOffsetElements = 0;
+                            // }
 
-                        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, chunk->mesh->ebo);
-                        glBufferData(GL_ELEMENT_ARRAY_BUFFER, chunk->cpuIndCount * sizeof(unsigned int), NULL, GL_STATIC_DRAW);
-                        glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, 0, chunk->cpuIndCount * sizeof(unsigned int), chunk->cpuIndices);
+                            chunk->mesh->baseVertex = (int)(masterVboOffsetBytes / (7 * sizeof(float)));
+                            chunk->mesh->firstIndex = (int)masterEboOffsetElements;
+                            chunk->mesh->indexCount = incomingIndCount;
 
-                        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 7 * sizeof(float), (void*)0);
-                        glEnableVertexAttribArray(0);
+                            glBindBuffer(GL_ARRAY_BUFFER, masterVbo);
+                            glBufferSubData(GL_ARRAY_BUFFER, masterVboOffsetBytes, vertSizeBytes, chunk->cpuVertices);
 
-                        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 7 * sizeof(float), (void*)(3 * sizeof(float)));
-                        glEnableVertexAttribArray(1);
+                            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, masterEbo);
+                            glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, masterEboOffsetElements * sizeof(unsigned int), indSizeBytes, chunk->cpuIndices);
 
-                        glVertexAttribPointer(2, 1, GL_FLOAT, GL_FALSE, 7 * sizeof(float), (void*)(5 * sizeof(float)));
-                        glEnableVertexAttribArray(2);
-
-                        glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, 7 * sizeof(float), (void*)(6 * sizeof(float)));
-                        glEnableVertexAttribArray(3);
-
-                        glBindVertexArray(0);
-
-                        chunk->mesh->indexCount = chunk->cpuIndCount;
+                            masterVboOffsetBytes += vertSizeBytes;
+                            masterEboOffsetElements += incomingIndCount;
+                        }
 
                         free(chunk->cpuVertices);
                         free(chunk->cpuIndices);
@@ -1899,11 +2092,34 @@ int main(){
                     LeaveCriticalSection(&chunkLock);
 
                     if (chunk->mesh != NULL && chunk->mesh->indexCount > 0) {
-                        drawWorldMesh(chunk->mesh);
+                        if (globalCommandCount < maxDrawCommands) {
+                            hostCommands[globalCommandCount].count = chunk->mesh->indexCount;
+                            hostCommands[globalCommandCount].instanceCount = 1;
+                            hostCommands[globalCommandCount].firstIndex = chunk->mesh->firstIndex;
+                            hostCommands[globalCommandCount].baseVertex = chunk->mesh->baseVertex;
+                            hostCommands[globalCommandCount].baseInstance = 0;
+                            globalCommandCount++;
+
+                            if (globalCommandCount >= maxDrawCommands) {
+                                glBindBuffer(GL_DRAW_INDIRECT_BUFFER, masterIndirectBuffer);
+                                glBufferSubData(GL_DRAW_INDIRECT_BUFFER, 0, globalCommandCount * sizeof(drawElementsIndirectCommand), hostCommands);
+                                drawWorldMesh(globalCommandCount);
+
+                                globalCommandCount = 0;
+                            }
+                        }
                     }
                 }
             }
         }
+
+        if (globalCommandCount > 0) {
+            glBindBuffer(GL_DRAW_INDIRECT_BUFFER, masterIndirectBuffer);
+            glBufferSubData(GL_DRAW_INDIRECT_BUFFER, 0, globalCommandCount * sizeof(drawElementsIndirectCommand), hostCommands);
+            drawWorldMesh(globalCommandCount);
+        }
+
+        glBindVertexArray(0);
 
         {
             int camTileX = (int)floorf(camX / (float)lodTileSize);
@@ -1923,8 +2139,13 @@ int main(){
                     if (!aabbFrustum(frustumPlanes, wx, -50.0f, wz, wx + lodTileSize, 300.0f, wz + lodTileSize)) continue;
 
                     lodTileEntry* tile = getOrCreateLodTile(tx, tz);
+                    if (!tile->tile.built && tile->tile.cellSize == 0) {
+                        int distForTier = (distTilesX > distTilesZ) ? distTilesX : distTilesZ;
+                        tile->tile.cellSize = cellSizeForTileDist(distForTier);
+                    }
+
                     if (!tile->tile.built) {
-                        if (builtThisFrame < 1) {
+                        if (builtThisFrame < 10) {
                             buildLodSize(tile);
                             builtThisFrame++;
                         } else {
@@ -1937,6 +2158,8 @@ int main(){
                     glBindVertexArray(0);
                 }
             }
+
+            unloadDistantLodChunks(camTileX, camTileZ, lodRadius + 2);
         }
 
         unloadDistantChunks(camChunkX, camChunkY, camChunkZ, renderRad + 1);
@@ -1952,10 +2175,57 @@ int main(){
         glDrawArrays(GL_LINES, 0, 4);
         glBindVertexArray(0);
 
+        if (hasBlockHighlight) {
+            float e = 0.002f;
+            float x0 = (float)highlightX - e;
+            float x1 = (float)highlightX + 1.0f - e;
+            float y0 = (float)highlightY - e;
+            float y1 = (float)highlightY + 1.0f - e;
+            float z0 = (float)highlightZ - e;
+            float z1 = (float)highlightZ + 1.0f - e;
+            float p[8][3] = {
+                {x0,y0,z0}, {x1,y0,z0}, {x1,y0,z1}, {x0,y0,z1},
+                {x0,y1,z0}, {x1,y1,z0}, {x1,y1,z1}, {x0,y1,z1}
+            };
+
+            int edges[12][2] = {
+                {0,1},{1,2},{2,3},{3,0},
+                {4,5},{5,6},{6,7},{7,4},
+                {0,4},{1,5},{2,6},{3,7}
+            };
+
+            float highlightVerts[24 * 7];
+
+            int hv = 0;
+
+            for (int e2 = 0; e2 < 12; e2++) {
+                for (int v = 0; v < 2; v++) {
+                    float* pt = p[edges[e2][v]];
+                    highlightVerts[hv++] = pt[0];
+                    highlightVerts[hv++] = pt[1];
+                    highlightVerts[hv++] = pt[2];
+                    highlightVerts[hv++] = 0.0f;
+                    highlightVerts[hv++] = 0.0f;
+                    highlightVerts[hv++] = 0.0f;
+                    highlightVerts[hv++] = 10.0f;
+                }
+            }
+
+            glUseProgram(shaderProgram);
+            glBindBuffer(GL_ARRAY_BUFFER, highlightVbo);
+            glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(highlightVerts), highlightVerts);
+
+            glBindVertexArray(highlightVao);
+            glLineWidth(2.0f);
+            glDrawArrays(GL_LINES, 0, 24);
+            glBindVertexArray(0);
+        }
+
         if (toggleDof) {
             glBindFramebuffer(GL_FRAMEBUFFER, 0);
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
             glDisable(GL_DEPTH_TEST);
+            glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
 
             glUseProgram(shaderProgram);
             glActiveTexture(GL_TEXTURE1);
@@ -1993,13 +2263,8 @@ int main(){
         chunks* chunk = &entry->chunk;
 
         if (chunk->mesh != NULL) {
-            glDeleteBuffers(1, &chunk->mesh->vbo);
-            glDeleteBuffers(1, &chunk->mesh->ebo);
-            glDeleteVertexArrays(1, &chunk->mesh->vao);
             free(chunk->mesh);
         }
-
-        voxelBlock *block, *tmp2;
 
         if (chunk->cpuVertices) free(chunk->cpuVertices);
         if (chunk->cpuIndices) free(chunk->cpuIndices);
@@ -2008,6 +2273,11 @@ int main(){
         free(entry);
 
     }
+
+    glDeleteVertexArrays(1, &masterVao);
+    glDeleteBuffers(1, &masterVbo);
+    glDeleteBuffers(1, &masterEbo);
+    glDeleteBuffers(1, &masterIndirectBuffer);
 
     DeleteCriticalSection(&chunkLock);
     glfwDestroyWindow(window);
