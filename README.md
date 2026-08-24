@@ -37,6 +37,25 @@ It also squeezes the performance out of low-end pc's.
 
 ## Setup:
 
-1. **use GCC**: This is because the c code uses R"(..)" code.
-2. **compile**: There will be a file, use the code and replace each path with its designated places.
-3. **explaining**: Also, you must read 'UNZIP CGLM.ZIP' or just do what it says.
+1. **to do**: You must read 'UNZIP CGLM.ZIP' first before compiling.
+2. **use GCC**: This is because the c code uses C++ raw string literals (GNU extension).
+3. **compile**: If you prefer the development version, or the Release version of the compiler, you can use the builds down below.
+
+And it also depends on what platfrom you are on. If you are on LINUX, you can compile with gcc. 
+
+Same with windows. You have to had/have MinGW64 installed, else you cant compile. 
+
+Please note that if you are using a strict c standard (-std=c99), please remove it. This code relies on GNU extensions as said earlier. GCC must be an environmental variable on windows.
+
+- step 1: Download the whole project to a folder.
+- step 2: Go inside the folder and either run:
+- Option A: Release build
+``` bash
+gcc openglse.c glad.c -Iinclude -Llib -O3 -march=native -mtune=native -ffast-math -flto -funroll-loops -fprefetch-loop-arrays -s -lglfw3 -lgdi32 -lopengl32 -lm -static -lpsapi -o openglse.exe
+```
+- Option B: Development build
+``` bash
+gcc openglse.c glad.c -Iinclude -Llib -O3 -march=native -mtune=native -ffast-math -s -lglfw3 -lgdi32 -lopengl32 -lm -static -lpsapi -o openglse.exe
+```
+
+- Note, for LINUX, dont add the .exe it will fail to open
