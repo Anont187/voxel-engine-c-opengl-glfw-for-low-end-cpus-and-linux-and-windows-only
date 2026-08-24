@@ -1,1 +1,0 @@
-"C:\...\gcc.exe" "C:\...\openglse.c" "C:\...\glad.c" -I"C:\...\include" -L"C:\...\lib" -O3 -march=silvermont -mtune=silvermont -ffast-math -flto -s -lglfw3 -lgdi32 -lopengl32 -lm -static -o "C:\...\openglse.exe"
