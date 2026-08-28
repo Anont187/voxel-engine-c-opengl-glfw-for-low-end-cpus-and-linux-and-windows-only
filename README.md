@@ -50,17 +50,11 @@ Please note that if you are using a strict c standard (-std=c99), please remove 
 - step 1: Download the whole project to a folder.
 - step 2: Go inside the folder and either run:
 - *please install dependencies first if on linux (e.g., `sudo apt install libglfw3-dev libgl1-mesa-dev libx11-dev libxi-dev libxrandr-dev` on Ubuntu/Debian).*
-- Windows/Linux Build (MinGW64 Required)
+- Windows Build (MinGW64 Required)
 ``` bash
 gcc openglse.c glad.c -Iinclude -Llib -O3 -march=native -mtune=native -ffast-math -flto -funroll-loops -fprefetch-loop-arrays -s -lglfw3 -lgdi32 -lopengl32 -lm -static -lpsapi -o openglse.exe
 ```
-
-- Also another reminder, please use wine on linux. Here is how to install wine on certain systems and also how to run the linux version on linux:
-1. Install wine
-   - **Ubuntu/Debian:** `sudo apt install wine stable`
-   - **Arch Linux:** `sudo pacman -S wine`
-2. Compile with Windows or Cross compile.
-3. Find the compiled .exe, and go into the folder it is in. After, run:
-   ```bash
-   wine openglse.exe
-   ```
+- Linux Build (Native GCC)
+```bash
+gcc openglse.c glad.c -Iinclude -Llib -O3 -march=native -mtune=native -ffast-math -flto -funroll-loops -fprefetch-loop-arrays -s -glfw -lGL -lm -lpthreadi -o openglse
+```
