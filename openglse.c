@@ -1170,6 +1170,7 @@ void unloadDistantChunks(int camChunkX, int camChunkY, int camChunkZ, int keepRa
     int deletedThisCall = 0;
 
     const int maxDeletesPerFrame = 8;
+    const int keepRadiusY = 8;
 
     HASH_ITER(hh, loadedChunks, entry, tmp) {
         if (deletedThisCall >= maxDeletesPerFrame) break;
@@ -1178,9 +1179,10 @@ void unloadDistantChunks(int camChunkX, int camChunkY, int camChunkZ, int keepRa
         int dy = entry->cy - camChunkY;
         int dz = entry->cz - camChunkZ;
 
-        if (abs(dx) > keepRadius || abs(dy) > keepRadius || abs(dz) > keepRadius) {
+        if (abs(dx) > keepRadius || abs(dy) > keepRadiusY || abs(dz) > keepRadius) {
             if (entry->chunk.isMeshing) continue;
             if (entry->chunk.isMeshReady) continue;
+            if (entry->chunk.isQueued) continue;
             if (entry->chunk.cpuVertices != NULL) continue;
 
             if (entry->chunk.mesh != NULL) {
@@ -1354,7 +1356,8 @@ void* backgroundChunkWorker(void* lpParam) {
         }
 
         if (!targetChunk->isGenerated) {
-            uint32_t tempVoxels[chunkSize][chunkSize] = {{0}};
+            uint32_t tempVoxels[chunkSize][chunkSize];
+            memset(tempVoxels, 0, sizeof(tempVoxels));
 
             int chunkMinY = tCy * chunkSize;
             int chunkMaxY = chunkMinY + chunkSize - 1;
@@ -1374,12 +1377,20 @@ void* backgroundChunkWorker(void* lpParam) {
                     for (int x = 0; x < chunkSize; x++) {
                         int terrainHeight = (int)sampleUpsampledHeight(grid, x, z);
 
-                        for (int y = 0; y < chunkSize; y++) {
-                            int worldY = chunkMinY + y;
+                        int localMaxY = terrainHeight - chunkMinY;
 
-                            if (worldY <= terrainHeight) {
-                                tempVoxels[y][z] |= (1U << x);
-                            }
+                        if (localMaxY < 0) {
+                            continue;
+                        }
+
+                        if (localMaxY >= chunkSize - 1) {
+                            localMaxY = chunkSize - 1;
+                        }
+
+                        uint32_t bit = 1u << x;
+
+                        for (int y = 0; y <= localMaxY; y++) {
+                            tempVoxels[y][z] |= bit;
                         }
                     }
                 }
@@ -1412,7 +1423,24 @@ void* backgroundChunkWorker(void* lpParam) {
         if (!neighboursReady) {
             targetChunk->isMeshing = false;
 
-            SleepConditionVariableCS(&chunkWorkReady, &chunkLock, 10);
+            enqueueDirtyChunk(targetChunk, tCx, tCy, tCz);
+
+            #if defined(_WIN32) || defined(_WIN64)
+                SleepConditionVariableCS(&chunkWorkReady, &chunkLock, 10);
+            #else
+                struct timespec outtime;
+
+                clock_gettime(CLOCK_REALTIME, &outtime);
+
+                outtime.tv_sec += 10 * 1000000L;
+
+                if (outtime.tv_nsec >= 1000000000L) {
+                    outtime.tv_sec++;
+                    outtime.tv_nsec -= 1000000000;
+                }
+                
+                pthread_cond_timedwait(&chunkWorkReady, &chunkLock, &outtime);
+            #endif
 
             MUTEX_UNLOCK(&chunkLock);
 
@@ -1747,6 +1775,8 @@ void* backgroundChunkWorker(void* lpParam) {
                 free(tempIndices);
 
                 targetChunk->isMeshing = false;
+
+                enqueueDirtyChunk(targetChunk, tCx, tCy, tCz);
 
                 MUTEX_UNLOCK(&chunkLock);
 
@@ -3279,7 +3309,7 @@ int main(){
         CloseHandle(workerHandle);
     #else
         MUTEX_LOCK(&chunkLock);
-        pthread_cond_broadcast(&chunkWorkReady);
+        pthread_cond_broadc7ast(&chunkWorkReady);
         MUTEX_UNLOCK(&chunkLock);
         pthread_join(workerHandle, NULL);
     #endif
@@ -3350,7 +3380,7 @@ int main(){
     fflush(stdout);
 
     MUTEX_DESTROY(&chunkLock);
-    MUTEX_UNLOCK(&lodLock);
+
     COND_DESTROY(&chunkWorkReady);
 
     glfwDestroyWindow(window);
