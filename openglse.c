@@ -794,19 +794,19 @@ void buildLodSizeCpu(lodTileEntry* entry) {
         }
     }
 
-    EnterCriticalSection(&lodLock);
+    MUTEX_LOCK(&lodLock);
 
     entry->tile.cpuVerts = verts;
     entry->tile.cpuVertCount = vc;
     entry->tile.cpuReady = true;
 
-    LeaveCriticalSection(&lodLock);
+    MUTEX_UNLOCK(&lodLock);
 }
 
 void uploadLoadTile2Gpu(lodTileEntry* entry) {
-    EnterCriticalSection(&lodLock);
+    MUTEX_LOCK(&lodLock);
     if (!entry->tile.cpuReady || !entry->tile.cpuVerts) {
-        LeaveCriticalSection(&lodLock);
+        MUTEX_UNLOCK(&lodLock);
         return;
     }
 
@@ -817,7 +817,7 @@ void uploadLoadTile2Gpu(lodTileEntry* entry) {
     entry->tile.cpuVerts = NULL;
     entry->tile.cpuReady = false;
 
-    LeaveCriticalSection(&lodLock);
+    MUTEX_UNLOCK(&lodLock);
 
     glGenVertexArrays(1, &entry->tile.vao);
     glGenBuffers(1, &entry->tile.vbo);
@@ -851,12 +851,12 @@ lodTileEntry* getOrCreateLodTile(int tx, int tz) {
 
     lodTileEntry* entry = NULL;
 
-    EnterCriticalSection(&lodLock);
+    MUTEX_LOCK(&lodLock);
 
     HASH_FIND(hh, loadedLodTiles, &key, sizeof(long long), entry);
     if (!entry) {
         entry = malloc(sizeof(lodTileEntry));
-        if (!entry) { LeaveCriticalSection(&lodLock); return NULL;}
+        if (!entry) { MUTEX_UNLOCK(&lodLock); return NULL;}
 
         entry->key = key;
         entry->tx = tx;
@@ -874,7 +874,7 @@ lodTileEntry* getOrCreateLodTile(int tx, int tz) {
         HASH_ADD(hh, loadedLodTiles, key, sizeof(long long), entry);
     }
 
-    LeaveCriticalSection(&lodLock);
+    MUTEX_UNLOCK(&lodLock);
 
     return entry;
 }
@@ -1211,7 +1211,7 @@ void unloadDistantLodChunks(int camTileX, int camTileZ) {
 
         if (dTx > lodRadius + 2 || dTz > lodRadius + 2) {
             
-            EnterCriticalSection(&lodLock);
+            MUTEX_LOCK(&lodLock);
 
             for (int i = lodBuildHead; i != lodBuildTail; i = (i + 1) % lodBuildQueueSize) {
                 if (lodBuildQueue[i] == lt) {
@@ -1221,7 +1221,7 @@ void unloadDistantLodChunks(int camTileX, int camTileZ) {
 
             bool safeToFree = !lt->tile.isBeingBuilt && !lt->tile.cpuReady;
 
-            LeaveCriticalSection(&lodLock);
+            MUTEX_UNLOCK(&lodLock);
 
             if (!safeToFree) continue;
 
@@ -1299,7 +1299,7 @@ void* backgroundChunkWorker(void* lpParam) {
 
         MUTEX_UNLOCK(&chunkLock);
 
-        EnterCriticalSection(&lodLock);
+        MUTEX_LOCK(&lodLock);
 
         if (lodBuildHead != lodBuildTail) {
             lodTileEntry* lodTile = lodBuildQueue[lodBuildHead];
@@ -1311,19 +1311,19 @@ void* backgroundChunkWorker(void* lpParam) {
                 lodTile = NULL;
             }
 
-            LeaveCriticalSection(&lodLock);
+            MUTEX_UNLOCK(&lodLock);
 
             if (lodTile) {
                 buildLodSizeCpu(lodTile);
 
-                EnterCriticalSection(&lodLock);
+                MUTEX_LOCK(&lodLock);
 
                 lodTile->tile.isBeingBuilt = false;
 
-                LeaveCriticalSection(&lodLock);
+                MUTEX_UNLOCK(&lodLock);
             }
         } else {
-            LeaveCriticalSection(&lodLock);
+            MUTEX_UNLOCK(&lodLock);
         }
 
         if (targetChunk == NULL) {
@@ -1800,7 +1800,7 @@ void* backgroundChunkWorker(void* lpParam) {
         targetChunk->isMeshing = false;
         MUTEX_UNLOCK(&chunkLock);
 
-        SwitchToThread();
+        THREAD_YIELD();
     }
 #if defined(_WIN32) || defined(_WIN64)
     return 0;
@@ -3150,7 +3150,7 @@ int main(){
 
                     lodTileEntry* tile = getOrCreateLodTile(tx, tz);
                     
-                    EnterCriticalSection(&lodLock);
+                    MUTEX_LOCK(&lodLock);
 
                     if (!tile->tile.built && tile->tile.cellSize == 0) {
                         int distForTier = (distTilesX > distTilesZ) ? distTilesX : distTilesZ;
@@ -3162,7 +3162,7 @@ int main(){
                     unsigned int tileVao = tile->tile.vao;
                     int tileVertCount = tile->tile.vertCount;
 
-                    LeaveCriticalSection(&lodLock);
+                    MUTEX_UNLOCK(&lodLock);
 
                     if (tileCpuReady) {
                         uploadLoadTile2Gpu(tile);
@@ -3173,12 +3173,12 @@ int main(){
                         int next = (lodBuildTail + 1) % lodBuildQueueSize;
                         if (next != lodBuildHead) {
 
-                            EnterCriticalSection(&lodLock);
+                            MUTEX_LOCK(&lodLock);
 
                             lodBuildQueue[lodBuildTail] = tile;
                             lodBuildTail = next;
 
-                            LeaveCriticalSection(&lodLock);
+                            MUTEX_UNLOCK(&lodLock);
 
                             COND_SIGNAL(&chunkWorkReady);
                         }
@@ -3309,7 +3309,7 @@ int main(){
         CloseHandle(workerHandle);
     #else
         MUTEX_LOCK(&chunkLock);
-        pthread_cond_broadc7ast(&chunkWorkReady);
+        pthread_cond_broadcast(&chunkWorkReady);
         MUTEX_UNLOCK(&chunkLock);
         pthread_join(workerHandle, NULL);
     #endif
