@@ -4,14 +4,63 @@
 #include <stdbool.h>
 #include <GLFW/glfw3.h>
 #include <math.h>
-#include <windows.h>
-#include <psapi.h> 
 #include <string.h>
 #include <stdint.h>
 #include "cglm/cglm.h"
 #include "uthash.h"
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
+#include <time.h>
+
+#if defined(_WIN32) || defined(_WIN64)
+    #ifndef WIN32_LEAN_AND_MEAN
+    #define WIN32_LEAN_AND_MEAN
+    #endif
+
+    #include <windows.h>
+    #include <psapi.h>
+
+    typedef CRITICAL_SECTION EngineMutex;
+    typedef CONDITION_VARIABLE EngineCondVar;
+    typedef HANDLE EngineThread;
+
+    #define MUTEX_INIT(mock) InitializeCriticalSection(mock)
+    #define MUTEX_LOCK(mock) EnterCriticalSection(mock)
+    #define MUTEX_UNLOCK(mock) LeaveCriticalSection(mock)
+    #define MUTEX_DESTROY(mock) DeleteCriticalSection(mock)
+
+    #define COND_INIT(cv)          InitializeConditionVariable(cv)
+    #define COND_SIGNAL(cv)        WakeConditionVariable(cv)
+    #define COND_DESTROY(cv)       /* binbows handle this native */
+    #define THREAD_YIELD()         SwitchToThread()
+    #define ATOMIC_CHECK(var)      InterlockedCompareExchange(&var, 0, 0)
+    #define ATOMIC_SET(var, val)   InterlockedExchange(&var, val)
+
+    volatile long isRunning = 1;
+#else
+    #include <pthread.h>
+    #include <unistd.h>
+    #include <sched.h>
+    #include <sys/time.h>
+
+    typedef pthread_mutex_t        EngineMutex;
+    typedef pthread_cond_t         EngineCondVar;
+    typedef pthread_t              EngineThread;
+
+    #define MUTEX_INIT(mock)       pthread_mutex_init(mock, NULL)
+    #define MUTEX_LOCK(mock)       pthread_mutex_lock(mock)
+    #define MUTEX_UNLOCK(mock)     pthread_mutex_unlock(mock)
+    #define MUTEX_DESTROY(mock)    pthread_mutex_destroy(mock)
+    
+    #define COND_INIT(cv)          pthread_cond_init(cv, NULL)
+    #define COND_SIGNAL(cv)        pthread_cond_signal(cv)
+    #define COND_DESTROY(cv)       pthread_cond_destroy(cv)
+    #define THREAD_YIELD()         sched_yield()
+    #define ATOMIC_CHECK(var)      __sync_val_compare_and_swap(&var, 0, 0)
+    #define ATOMIC_SET(var, val)   __sync_lock_test_and_set(&var, val)
+
+    volatile int isRunning = 1;
+#endif
 
 const char* vertexSrc = R"(
 #version 430
@@ -57,12 +106,20 @@ flat in int faceIdPass;
 uniform sampler2DArray texAtlas;
 uniform sampler2D dofColorTex;
 uniform sampler2D dofDepthTex;
+
 uniform vec3 sunDir;
 uniform vec3 camPos;
 
 uniform float dofNear;
 uniform float dofFar;
 uniform float dofFocusDist;
+uniform float uTimeOfday;
+
+uniform int dofEnabled;
+
+uniform mat4 projection;
+
+float pi = 3.14159265;
 
 const vec3 faceNorms[6] = vec3[6](
     vec3(-1.0, 0.0, 0.0),
@@ -82,18 +139,70 @@ const vec3 sideNorms[4] = vec3[4](
 
 out vec4 fragColor;
 
-vec3 applyFog(vec3 baseColor, vec3 fragWorldPos) {
+vec3 applyFog(vec3 baseColor, vec3 fragWorldPos, vec3 skyColor) {
     float dist = distance(camPos, fragWorldPos);
-    float fogStart = 100.0;
+    float fogStart = 55.0;
     float fogEnd = 180.0;
     float fogAmount = clamp((dist - fogStart) / (fogEnd - fogStart), 0.0, 1.0);
 
     vec3 fogColor = vec3(0.2, 0.3, 0.3);
 
-    return mix(baseColor, fogColor, fogAmount);
+    return mix(baseColor, skyColor, fogAmount);
 }
 
 void main() {
+    float sunAngle = uTimeOfday * 2.0 * pi;
+
+    vec3 sunDirDynamic = normalize(vec3(cos(sunAngle), sin(sunAngle), 0.3));
+
+    float dayFactor = clamp(sin(sunAngle), 0.0, 1.0);
+    float duskFactor = clamp(1.0 - abs(sin(sunAngle)) * 2.0, 0.0, 1.0);
+
+    vec3 daySkyColor = vec3(0.2, 0.3, 0.3);
+    vec3 nightSkyColor = vec3(0.01, 0.01, 0.05);
+    vec3 duskSkyColor = vec3(0.6, 0.25, 0.1);
+    vec3 skyColor = mix(mix(nightSkyColor, daySkyColor, dayFactor), duskSkyColor, duskFactor);
+
+    float ambientMin = mix(0.05, 0.35, dayFactor);
+    float aoFactor = 1.0;
+
+    if (dofEnabled == 1 && faceIdPass != 6 && faceIdPass != 9) {
+        float depthRaw = texture(dofDepthTex, uvPass).r;
+        float ndc = depthRaw * 2.0 - 1.0;
+        float linearDepth = (2.0 * dofNear * dofFar) / (dofFar + dofNear - ndc * (dofFar - dofNear));
+        float radius = 0.005;
+
+        int samples = 8;
+
+        vec2 noise[4] = vec2[4](
+            vec2(0.0, 1.0), vec2(0.866, 0.5), vec2(0.866, -0.5), vec2(0.0, -1.0)
+        );
+
+        vec2 randomVec = noise[int(gl_FragCoord.x) % 4];
+
+        float occlusion = 0.0;
+
+        for (int i = 0; i < samples; i++) {
+            float angle = 6.28318 * float(i) / float(samples);
+
+            vec2 offset = vec2(cos(angle), sin(angle)) * radius;
+
+            offset += randomVec * radius * 0.5;
+
+            vec2 sampleUv = uvPass + offset;
+
+            float sampleDepthRaw = texture(dofDepthTex, sampleUv).r;
+            float sampleNdc = sampleDepthRaw * 2.0 - 1.0;
+            float sampleLinear = (2.0 * dofNear * dofFar) / (dofFar + dofNear - sampleNdc * (dofFar - dofNear));
+            float rangeCheck = abs(linearDepth - sampleLinear) < 0.5 ? 1.0 : 0.0;
+
+            occlusion += (sampleLinear < linearDepth ? 1.0 : 0.0) * rangeCheck;
+        }
+        occlusion /= float(samples);
+
+        aoFactor = 1.0 - occlusion * 0.5;
+    }
+
     if (faceIdPass == 6) {
         fragColor = vec4(1.0, 1.0, 1.0, 0.9);
         return;
@@ -101,9 +210,9 @@ void main() {
 
     if (faceIdPass == 7) {
         vec3 grassCol = vec3(0.168f, 0.3686f, 0.0471f);
-        float diff = max(dot(vec3(0.0, 1.0, 0.0), sunDir), 0.0);
+        float diff = max(dot(vec3(0.0, 1.0, 0.0), sunDirDynamic), 0.0);
         float lighting = 0.35 + 0.65 * diff;
-        fragColor = vec4(applyFog(grassCol * lighting, worldPos), 1.0);
+        fragColor = vec4(applyFog(grassCol * lighting, worldPos, skyColor) * aoFactor, 1.0);
         return;
     } 
 
@@ -111,10 +220,10 @@ void main() {
         vec3 dirtCol = vec3(0.4667f, 0.3059f, 0.0902f) * 0.7;
         vec3 normal = sideNorms[layerPass];
 
-        float diff = max(dot(normal, sunDir), 0.0);
+        float diff = max(dot(normal, sunDirDynamic), 0.0);
         float lighting = 0.35 + 0.65 * diff;
 
-        fragColor = vec4(applyFog(dirtCol * lighting, worldPos), 1.0);
+        fragColor = vec4(applyFog(dirtCol * lighting, worldPos, skyColor) * aoFactor, 1.0);
         return;
     }
 
@@ -160,12 +269,10 @@ void main() {
 
     vec3 normal = faceNorms[faceIdPass];
 
-    float diff = max(dot(normal, sunDir), 0.0);
+    float diff = max(dot(normal, sunDirDynamic), 0.0);
     float lighting = 0.35 + 0.65 * diff;
 
-    texColor.rgb *= lighting;
-
-    fragColor = vec4(applyFog(texColor.rgb, worldPos), texColor.a);
+    fragColor = vec4(applyFog(texColor.rgb * lighting, worldPos, skyColor) * aoFactor, texColor.a);
 }
 )";
 
@@ -174,13 +281,12 @@ void main() {
 #define lodTileSize 64
 #define lodCellSize 4
 #define lodRadius 6
-#define maxTerrainHeight 125
+#define maxTerrainHeight 140
 #define noiseStep 4
 #define noiseGridSize (chunkSize / noiseStep + 1)
 #define maxDrawCommands 4096
 #define masterVboSize (64 * 1024 * 1024 * sizeof(float))
 #define masterEboSize (32 * 1024 * 1024 * sizeof(unsigned int))
-#define voxelIdx(dx, dy, dz, ly, lz) (((((dx) * 3 + (dy)) * 3 + (dz)) * chunkSize + (ly)) * chunkSize + (lz))
 #define maxUploadsPerFrame 256
 #define dirtyQueueSize 512
 #define lodBuildQueueSize 64
@@ -213,7 +319,7 @@ int currentIndirectBuffer = 0;
 
 float pcamSpeed = 4.3f;
 float rotSpeed = 60.0f;
-float sprintSpeed = 12.0f;
+float sprintSpeed = 50.0f;
 float sensitivity = 0.1f;
 float baseSensitivity = 0.1f;
 float bfov = 90.0f;
@@ -238,6 +344,7 @@ float velY = 0.0f;
 float flyVelX = 0.0f;
 float flyVelY = 0.0f;
 float flyVelZ = 0.0f;
+float PI = 3.14159265f;
 
 double lastSpaceTapTime = -1.0;
 
@@ -318,6 +425,8 @@ typedef struct {
     bool gpuUploaded;
     uint32_t meshVersion;
     uint32_t cpuMeshVersion;
+
+    bool isQueued;
 } chunks;
 
 typedef struct {
@@ -386,29 +495,31 @@ dirtyQueueEntry dirtyQueue[dirtyQueueSize];
 const char* stringed = "basic window";
 const char* texturePath[] = { "textures/dirt.png", "textures/grass.png" };
 
-CRITICAL_SECTION chunkLock;
-CRITICAL_SECTION lodLock;
+EngineMutex chunkLock;
+EngineMutex lodLock;
 
-CONDITION_VARIABLE chunkWorkReady;
+EngineCondVar chunkWorkReady;
 
-volatile LONG isRunning = true;
-
-float noiseFade(float t) {
+static inline float noiseFade(float t) {
     return t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f);
 }
 
-float noiseLerp(float t, float a, float b) {
+static inline float noiseLerp(float t, float a, float b) {
     return a + t * (b - a);
 }
 
-float noiseGrad(int hash, float x, float y) {
+static inline float noiseGrad(int hash, float x, float y) {
     int h = hash & 7;
     float u = h < 4 ? x : y;
     float v = h < 4 ? y : x;
     return ((h & 1) == 0 ? u : -u) + ((h & 2) == 0 ? v : -v);
 }
 
-float perlin2d(float x, float y) {
+static inline int voxelIdx(int dx, int dy, int dz, int ly, int lz) {
+    return (((dx * 3 + dy) * 3 + dz) * chunkSize + ly) * chunkSize + lz;
+}
+
+static inline float perlin2d(float x, float y) {
     int X = (int)floorf(x) & 255;
     int Y = (int)floorf(y) & 255;
 
@@ -428,7 +539,7 @@ float perlin2d(float x, float y) {
     return (res+ 1.0f) * 0.5f;
 }
 
-float fbm(float x, float z, int octaves, float persistence, float lacunarity) {
+static inline float fbm(float x, float z, int octaves, float persistence, float lacunarity) {
     float total = 0.0f;
     float amplitude = 1.0f;
     float frequency = 1.0f;
@@ -444,7 +555,7 @@ float fbm(float x, float z, int octaves, float persistence, float lacunarity) {
     return total / maxAmplitude;
 }
 
-float getTerrainHeight(float wx, float wz) {
+static inline float getTerrainHeight(float wx, float wz) {
     float biomeN = perlin2d(wx * scale * 0.03f, wz * scale * 0.03f);
     
     int biome;
@@ -490,7 +601,7 @@ void buildCoarseHeightGrid(int cx, int cz, float grid[noiseGridSize][noiseGridSi
     }
 }
 
-float sampleUpsampledHeight(float grid[noiseGridSize][noiseGridSize], int localX, int localZ) {
+static inline float sampleUpsampledHeight(float grid[noiseGridSize][noiseGridSize], int localX, int localZ) {
     int gx0 = localX / noiseStep;
     int gz0 = localZ / noiseStep;
     int gx1 = gx0 + 1;
@@ -782,6 +893,8 @@ bool aabbFrustum(plane planes[6], float minX, float minY, float minZ, float maxX
 }
 
 void enqueueDirtyChunk(chunks* chunk, int cx, int cy, int cz) {
+    if (chunk->isQueued) return;
+
     int next = (dirtyQueueTail + 1) % dirtyQueueSize;
     if (next == dirtyQueueHead) return;
 
@@ -791,13 +904,17 @@ void enqueueDirtyChunk(chunks* chunk, int cx, int cy, int cz) {
     dirtyQueue[dirtyQueueTail].cz = cz;
     dirtyQueueTail = next;
 
-    WakeConditionVariable(&chunkWorkReady);
+    chunk->isQueued = true;
+
+    COND_SIGNAL(&chunkWorkReady);
 }
 
 bool dequeueDirtyChunk(chunks** chunk, int* cx, int* cy, int* cz) {
     while (dirtyQueueHead != dirtyQueueTail) {
         dirtyQueueEntry* e = &dirtyQueue[dirtyQueueHead];
         dirtyQueueHead = (dirtyQueueHead + 1) % dirtyQueueSize;
+
+        e->chunk->isQueued = false;
 
         if (!e->chunk->isDirty || e->chunk->isMeshReady || e->chunk->isMeshing || e->chunk->isBroken) continue;
 
@@ -815,21 +932,21 @@ bool dequeueDirtyChunk(chunks** chunk, int* cx, int* cy, int* cz) {
 chunks* getOrCreateChunk(int cx, int cy, int cz) {
     uint64_t key = getChunkkey(cx, cy, cz);
 
-    EnterCriticalSection(&chunkLock);
+    MUTEX_LOCK(&chunkLock);
 
     chunkEntry* entry = NULL;
 
     HASH_FIND(hh, loadedChunks, &key, sizeof(uint64_t), entry);
 
     if (entry) {
-        LeaveCriticalSection(&chunkLock);
+        MUTEX_UNLOCK(&chunkLock);
         return &entry->chunk;
     }
 
     entry = malloc(sizeof(chunkEntry));
 
     if (!entry) {
-        LeaveCriticalSection(&chunkLock);
+        MUTEX_UNLOCK(&chunkLock);
         return NULL;
     }
 
@@ -852,6 +969,7 @@ chunks* getOrCreateChunk(int cx, int cy, int cz) {
     entry->chunk.gpuUploaded = false;
     entry->chunk.meshVersion = 0;
     entry->chunk.cpuMeshVersion = 0;
+    entry->chunk.isQueued = false;
 
     enqueueDirtyChunk(&entry->chunk, cx, cy, cz);
 
@@ -859,7 +977,7 @@ chunks* getOrCreateChunk(int cx, int cy, int cz) {
 
     HASH_ADD(hh, loadedChunks, key, sizeof(uint64_t), entry);;
 
-    LeaveCriticalSection(&chunkLock);
+    MUTEX_UNLOCK(&chunkLock);
 
     return &entry->chunk;
 }
@@ -887,7 +1005,7 @@ bool isSolidAtWorld(int x, int y, int z) {
     if (localY < 0) localY += chunkSize;
     if (localZ < 0) localZ += chunkSize;
 
-    EnterCriticalSection(&chunkLock);
+    MUTEX_LOCK(&chunkLock);
 
     chunks* chunk = getChunkSilentUnlocked(cx, cy, cz);
     bool solid = false;
@@ -896,7 +1014,7 @@ bool isSolidAtWorld(int x, int y, int z) {
         solid = (chunk->voxels[localY][localZ] & (1U << localX)) != 0;
     }
 
-    LeaveCriticalSection(&chunkLock);
+    MUTEX_UNLOCK(&chunkLock);
 
     return solid;
 }
@@ -923,7 +1041,7 @@ bool raycastVoxel(float ox, float oy, float oz, float dx, float dy, float dz, fl
     int prevZ = z;
     float dist = 0.0f;
 
-    EnterCriticalSection(&chunkLock);
+    MUTEX_LOCK(&chunkLock);
 
     while (dist < maxDist) {
         int cx = (int)floorf((float)x / chunkSize);
@@ -937,7 +1055,7 @@ bool raycastVoxel(float ox, float oy, float oz, float dx, float dy, float dz, fl
 
         if (chunk && chunk->isGenerated && (chunk->voxels[ly][lz] & (1U << lx)) != 0) {
             
-            LeaveCriticalSection(&chunkLock);
+            MUTEX_UNLOCK(&chunkLock);
 
             *hitX = x;
             *hitY = y;
@@ -967,7 +1085,7 @@ bool raycastVoxel(float ox, float oy, float oz, float dx, float dy, float dz, fl
         }
     }
 
-    LeaveCriticalSection(&chunkLock);
+    MUTEX_UNLOCK(&chunkLock);
 
     return false;
 }
@@ -982,7 +1100,7 @@ bool checkPlayerCollision(float px, float feetY, float pz) {
     int minZ = (int)floorf(pz - halfWidth);
     int maxZ = (int)floorf(pz + halfWidth);
 
-    EnterCriticalSection(&chunkLock);
+    MUTEX_LOCK(&chunkLock);
 
     for (int x = minX; x <= maxX; x++) {
         for (int y = minY; y <= maxY; y++) {
@@ -998,7 +1116,7 @@ bool checkPlayerCollision(float px, float feetY, float pz) {
 
                 if (chunk && chunk->isGenerated) {
                     if ((chunk->voxels[ly][lz] & (1U << lx)) != 0) {
-                        LeaveCriticalSection(&chunkLock);
+                        MUTEX_UNLOCK(&chunkLock);
                         return true;
                     }
                 }
@@ -1006,7 +1124,7 @@ bool checkPlayerCollision(float px, float feetY, float pz) {
         }
     }
 
-    LeaveCriticalSection(&chunkLock);
+    MUTEX_UNLOCK(&chunkLock);
 
     return false;
 }
@@ -1046,7 +1164,7 @@ void tryMove(float dx, float dy, float dz) {
 }
 
 void unloadDistantChunks(int camChunkX, int camChunkY, int camChunkZ, int keepRadius) {
-    EnterCriticalSection(&chunkLock);
+    MUTEX_LOCK(&chunkLock);
     chunkEntry *entry, *tmp;
 
     int deletedThisCall = 0;
@@ -1072,9 +1190,6 @@ void unloadDistantChunks(int camChunkX, int camChunkY, int camChunkZ, int keepRa
 
             if (entry->chunk.cpuVertices) free(entry->chunk.cpuVertices);
             if (entry->chunk.cpuIndices) free(entry->chunk.cpuIndices);
-            if (entry->chunk.occlusionQuery != 0) {
-                glDeleteQueries(1, &entry->chunk.occlusionQuery);
-            }
 
             HASH_DEL(loadedChunks, entry);
             free(entry);
@@ -1083,7 +1198,7 @@ void unloadDistantChunks(int camChunkX, int camChunkY, int camChunkZ, int keepRa
         }
     }
 
-    LeaveCriticalSection(&chunkLock);
+    MUTEX_UNLOCK(&chunkLock);
 }
 
 void unloadDistantLodChunks(int camTileX, int camTileZ) {
@@ -1124,10 +1239,13 @@ void unloadDistantLodChunks(int camTileX, int camTileZ) {
         }
     }
 }
-
+#if defined(_WIN32) || defined(_WIN64)
 DWORD WINAPI backgroundChunkWorker(LPVOID lpParam) {
-    while (InterlockedCompareExchange(&isRunning, 0, 0)) {
-        EnterCriticalSection(&chunkLock);
+#else
+void* backgroundChunkWorker(void* lpParam) {
+#endif
+    while (ATOMIC_CHECK(isRunning)) {
+        MUTEX_LOCK(&chunkLock);
 
         chunks* targetChunk = NULL;
 
@@ -1177,7 +1295,7 @@ DWORD WINAPI backgroundChunkWorker(LPVOID lpParam) {
             targetChunk->isMeshing = true;
         }
 
-        LeaveCriticalSection(&chunkLock);
+        MUTEX_UNLOCK(&chunkLock);
 
         EnterCriticalSection(&lodLock);
 
@@ -1207,20 +1325,30 @@ DWORD WINAPI backgroundChunkWorker(LPVOID lpParam) {
         }
 
         if (targetChunk == NULL) {
-            EnterCriticalSection(&chunkLock);
+            MUTEX_LOCK(&chunkLock);
 
-            SleepConditionVariableCS(&chunkWorkReady, &chunkLock, 5);
+            #if defined(_WIN32) || defined(_WIN64)
+                SleepConditionVariableCS(&chunkWorkReady, &chunkLock, 5);
+            #else
+                struct timespec outtime;
 
-            LeaveCriticalSection(&chunkLock);
+                clock_gettime(CLOCK_REALTIME, &outtime);
+
+                outtime.tv_sec += 5;
+                
+                pthread_cond_timedwait(&chunkWorkReady, &chunkLock, &outtime);
+            #endif
+
+            MUTEX_UNLOCK(&chunkLock);
             continue;
         }
 
         uint32_t versionAtStart = targetChunk->meshVersion;
 
-        if (!InterlockedCompareExchange(&isRunning, 0, 0)) {
-            EnterCriticalSection(&chunkLock);
+        if (!ATOMIC_CHECK(isRunning)) {
+            MUTEX_LOCK(&chunkLock);
             targetChunk->isMeshing = false;
-            LeaveCriticalSection(&chunkLock);
+            MUTEX_UNLOCK(&chunkLock);
 
             break;
         }
@@ -1231,9 +1359,11 @@ DWORD WINAPI backgroundChunkWorker(LPVOID lpParam) {
             int chunkMinY = tCy * chunkSize;
             int chunkMaxY = chunkMinY + chunkSize - 1;
 
+            chunkEntry *entry;
+
             if (chunkMinY > (int)(maxTerrainHeight + 12.0f)) {
                 // a i r
-            } else if (chunkMaxY < -12) {
+            } else if (chunkMaxY < -22) {
                 memset(tempVoxels, 0xFF, sizeof(tempVoxels));
             } else {
                 float grid[noiseGridSize][noiseGridSize];
@@ -1255,16 +1385,16 @@ DWORD WINAPI backgroundChunkWorker(LPVOID lpParam) {
                 }
             }
 
-            EnterCriticalSection(&chunkLock);
+            MUTEX_LOCK(&chunkLock);
 
             memcpy(targetChunk->voxels, tempVoxels, sizeof(tempVoxels));
 
             targetChunk->isGenerated = 1;
 
-            LeaveCriticalSection(&chunkLock);
+            MUTEX_UNLOCK(&chunkLock);
         }
 
-        EnterCriticalSection(&chunkLock);
+        MUTEX_LOCK(&chunkLock);
 
         bool neighboursReady = true;
 
@@ -1282,20 +1412,22 @@ DWORD WINAPI backgroundChunkWorker(LPVOID lpParam) {
         if (!neighboursReady) {
             targetChunk->isMeshing = false;
 
-            LeaveCriticalSection(&chunkLock);
+            SleepConditionVariableCS(&chunkWorkReady, &chunkLock, 10);
+
+            MUTEX_UNLOCK(&chunkLock);
 
             continue;
         }
 
-        LeaveCriticalSection(&chunkLock);
+        MUTEX_UNLOCK(&chunkLock);
 
         int dim = chunkSize + 2;
 
-        bool* blocks = calloc(dim * dim * dim, sizeof(bool));
+        uint8_t* blocks = calloc(dim * dim * dim, sizeof(uint8_t));
         if (!blocks) {
-            EnterCriticalSection(&chunkLock);
+            MUTEX_LOCK(&chunkLock);
             targetChunk->isMeshing = false;
-            LeaveCriticalSection(&chunkLock);
+            MUTEX_UNLOCK(&chunkLock);
             continue;
         }
 
@@ -1303,32 +1435,47 @@ DWORD WINAPI backgroundChunkWorker(LPVOID lpParam) {
         if (!localVoxels) {
             free(blocks);
 
-            EnterCriticalSection(&chunkLock);
+            MUTEX_LOCK(&chunkLock);
 
             targetChunk->isMeshing = false;
 
-            LeaveCriticalSection(&chunkLock);
+            MUTEX_UNLOCK(&chunkLock);
 
             continue;
         }
 
         bool hasTarget[3][3][3] = {false};
 
-        EnterCriticalSection(&chunkLock);
+        MUTEX_LOCK(&chunkLock);
 
-        for (int dx = -1; dx <= 1; dx++) {
-            for (int dy = -1; dy <= 1; dy++) {
-                for (int dz = -1; dz <= 1; dz++) {
-                    chunks* target = getChunkSilentUnlocked(tCx + dx, tCy + dy, tCz + dz);
-                    if (target) {
-                        hasTarget[dx + 1][dy + 1][dz + 1] = true;
-                        memcpy(localVoxels + voxelIdx(dx + 1, dy + 1, dz + 1, 0, 0), target->voxels, chunkSize * chunkSize * sizeof(uint32_t));
+        for (int dx = 0; dx < 3; dx++) {
+            for (int dy = 0; dy < 3; dy++) {
+                for (int dz = 0; dz < 3; dz++) {
+                    chunks* neighbourChunk = getChunkSilentUnlocked(tCx + (dx - 1), tCy + (dy - 1), tCz + (dz - 1));
+
+                    if (neighbourChunk && neighbourChunk->isGenerated) {
+                        hasTarget[dx][dy][dz] = true;
+
+                        memcpy(&localVoxels[voxelIdx(dx, dy, dz, 0, 0)], neighbourChunk->voxels, chunkSize * chunkSize * sizeof(uint32_t));
+                    } else {
+                        hasTarget[dx][dy][dz] = false;
+                        memset(&localVoxels[voxelIdx(dx, dy, dz, 0, 0)], 0, chunkSize * chunkSize * sizeof(uint32_t));
                     }
                 }
             }
         }
 
-        LeaveCriticalSection(&chunkLock);
+        MUTEX_UNLOCK(&chunkLock);
+
+        for (int y = 0; y < chunkSize; y++) {
+            for (int z = 0; z < chunkSize; z++) {
+                uint32_t row = localVoxels[voxelIdx(1, 1, 1, y, z)];
+
+                for (int x = 0; x < chunkSize; x++) {
+                    blocks[(x + 1) * dim * dim + (y + 1) * dim + (z + 1)] = (row >> x) & 1;
+                }
+            }
+        }
 
         for (int lx = -1; lx <= chunkSize; lx++) {
             for (int ly = -1; ly <= chunkSize; ly++) {
@@ -1337,12 +1484,12 @@ DWORD WINAPI backgroundChunkWorker(LPVOID lpParam) {
                     int targetDy = (ly < 0) ? -1 : (ly >= chunkSize ? 1 : 0);
                     int targetDz = (lz < 0) ? -1 : (lz >= chunkSize ? 1 : 0);
 
-                    if (hasTarget[targetDx + 1][targetDy + 1][targetDz + 1]) {
+                    if (hasTarget[targetDx+1][targetDy+1][targetDz+1]) {
                         int tLx = (lx + chunkSize) % chunkSize;
                         int tLy = (ly + chunkSize) % chunkSize;
                         int tLz = (lz + chunkSize) % chunkSize;
 
-                        blocks[(lx + 1) * dim * dim + (ly + 1) * dim + (lz + 1)] = (localVoxels[voxelIdx(targetDx + 1, targetDy + 1, targetDz + 1, tLy,tLz)] >> tLx) & 1;
+                        blocks[(lx+1)*dim*dim + (ly+1)*dim + (lz+1)] = (localVoxels[voxelIdx(targetDx+1, targetDy+1, targetDz+1, tLy, tLz)] >> tLx) & 1;
                     }
                 }
             }
@@ -1394,7 +1541,7 @@ DWORD WINAPI backgroundChunkWorker(LPVOID lpParam) {
         }
 
         for (int d = 0; d < 3; d++) {
-            if (!InterlockedCompareExchange(&isRunning, 0, 0)) { meshGenFailed = 2; break; }
+            if (!ATOMIC_CHECK(isRunning)) { meshGenFailed = 2; break; }
 
             int u = (d + 1) % 3;
             int v = (d + 2) % 3;
@@ -1408,6 +1555,12 @@ DWORD WINAPI backgroundChunkWorker(LPVOID lpParam) {
 
                 for (x[v] = 0; x[v] < chunkSize; ++x[v]) {
                     for (x[u] = 0; x[u] < chunkSize; ++x[u]) {
+                        if (!ATOMIC_CHECK(isRunning)) {
+                            meshGenFailed = 2;
+
+                            break;
+                        }
+
                         int blkCurX = x[0] + 1;
                         int blkCurY = x[1] + 1;
                         int blkCurZ = x[2] + 1;
@@ -1563,7 +1716,7 @@ DWORD WINAPI backgroundChunkWorker(LPVOID lpParam) {
         free(mask);
         free(blocks);
 
-        EnterCriticalSection(&chunkLock);
+        MUTEX_LOCK(&chunkLock);
 
         if (meshGenFailed == 2) {
             free(tempVertices);
@@ -1595,14 +1748,15 @@ DWORD WINAPI backgroundChunkWorker(LPVOID lpParam) {
 
                 targetChunk->isMeshing = false;
 
-                LeaveCriticalSection(&chunkLock);
+                MUTEX_UNLOCK(&chunkLock);
 
                 continue;
             }
 
             if (targetChunk->cpuVertices) { free(targetChunk->cpuVertices); targetChunk->cpuVertices = NULL; }
             if (targetChunk->cpuIndices) { free(targetChunk->cpuIndices); targetChunk->cpuIndices = NULL; }
-
+        
+            targetChunk->queryIssued = false;
             targetChunk->cpuVertices = tempVertices;
             targetChunk->cpuIndices = tempIndices;
             targetChunk->gpuUploaded = false;
@@ -1612,10 +1766,17 @@ DWORD WINAPI backgroundChunkWorker(LPVOID lpParam) {
             targetChunk->genFailCount = 0;
             targetChunk->cpuMeshVersion = targetChunk->meshVersion;
         }
+
         targetChunk->isMeshing = false;
-        LeaveCriticalSection(&chunkLock);
+        MUTEX_UNLOCK(&chunkLock);
+
+        SwitchToThread();
     }
+#if defined(_WIN32) || defined(_WIN64)
     return 0;
+#else
+    return NULL;
+#endif
 }
 
 unsigned int loadTextureArray(const char** paths, int count, int texSize) {
@@ -1683,11 +1844,33 @@ void keyCallback(GLFWwindow* window, int key, int scancodde, int action, int mod
 }
 
 int memUsage() {
+#if defined(_WIN32) || defined(_WIN64)
     PROCESS_MEMORY_COUNTERS pmc;
     if (GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&pmc, sizeof(pmc))) {
         return (int)(pmc.WorkingSetSize / (1024 * 1024));
     }
     return 0;
+#else
+    FILE* file = fopen("/proc/self/statm", "r");
+
+    if (!file) return 0;
+
+    long totalPages = 0;
+    long residentPages = 0;
+
+    if (fscanf(file, "%ld %ld", &totalPages, &residentPages) != 2) {
+        fclose(file);
+        return 0;
+    }
+
+    fclose(file);
+
+    long pageSize = sysconf(_SC_PAGESIZE);
+
+    if (pageSize <= 0) return 0;
+
+    return (int)((residentPages * pageSize) / (1024 * 1024));
+#endif
 }
 
 void updFpsCounter(GLFWwindow* window, double time, size_t ramSize, float camX, float camY, float camZ, int commandCount, int triangles) {
@@ -1727,17 +1910,22 @@ void drawWorldMesh(int commandCount) {
 }
 
 void enqueueDirtyChunkFront(chunks* chunk, int cx, int cy, int cz) {
+    if (chunk->isQueued) return;
+
     int prev = (dirtyQueueHead - 1 + dirtyQueueSize) % dirtyQueueSize;
 
     if (prev == dirtyQueueTail) return;
 
     dirtyQueueHead = prev;
+
     dirtyQueue[dirtyQueueHead].chunk = chunk;
     dirtyQueue[dirtyQueueHead].cx = cx;
     dirtyQueue[dirtyQueueHead].cy = cy;
     dirtyQueue[dirtyQueueHead].cz = cz;
 
-    WakeConditionVariable(&chunkWorkReady);
+    chunk->isQueued = true;
+
+    COND_SIGNAL(&chunkWorkReady);
 }
 
 void toggleVoxel(int x, int y, int z) {
@@ -1756,13 +1944,13 @@ void toggleVoxel(int x, int y, int z) {
     chunks* chunk = getOrCreateChunk(cx, cy, cz);
     if (!chunk) return;
 
-    EnterCriticalSection(&chunkLock);
+    MUTEX_LOCK(&chunkLock);
 
     chunk->voxels[localY][localZ] ^= (1U << localX);
     chunk->isDirty = 1;
     chunk->meshVersion++;
 
-    enqueueDirtyChunkFront(chunk, cx, cy, cz);
+    enqueueDirtyChunk(chunk, cx, cy, cz);
 
     if (localX == 0) {
         chunks* n = getChunkSilentUnlocked(cx - 1, cy, cz);
@@ -1794,7 +1982,7 @@ void toggleVoxel(int x, int y, int z) {
         if (n) { n->isDirty = 1; n->meshVersion++; enqueueDirtyChunk(n, cx, cy, cz + 1); }
     }
 
-    LeaveCriticalSection(&chunkLock);
+    MUTEX_UNLOCK(&chunkLock);
 }
 
 void processInput(GLFWwindow* window, float deltaTime) {
@@ -2099,7 +2287,7 @@ void placeBlock(int x, int y, int z, bool value) {
     chunks* chunk = getOrCreateChunk(cx, cy, cz);
     if (!chunk) return;
 
-    EnterCriticalSection(&chunkLock);
+    MUTEX_LOCK(&chunkLock);
 
     if (localX == 0) {
         chunks* n = getChunkSilentUnlocked(cx - 1, cy, cz);
@@ -2142,7 +2330,7 @@ void placeBlock(int x, int y, int z, bool value) {
 
     enqueueDirtyChunkFront(chunk, cx, cy, cz); 
 
-    LeaveCriticalSection(&chunkLock);
+    MUTEX_UNLOCK(&chunkLock);
 }
 
 void ensureDofFramebuffer(int width, int height) {
@@ -2222,6 +2410,12 @@ void reuploadAllChunks(void) {
 int main(){
     printf("STARTUP\n");
     fflush(stdout);
+
+    EngineThread workerHandle;
+
+    MUTEX_INIT(&chunkLock);
+    MUTEX_INIT(&lodLock);
+    COND_INIT(&chunkWorkReady);
     
     if (!glfwInit()) {
         printf("Couldn't initialize GLFW.\n");
@@ -2436,6 +2630,8 @@ int main(){
     GLint dofFarLoc = glGetUniformLocation(shaderProgram, "dofFar");
     GLint dofFocusDistLoc = glGetUniformLocation(shaderProgram, "dofFocusDist");
     GLint camPosLoc = glGetUniformLocation(shaderProgram, "camPos");
+    GLint dofOnLoc = glGetUniformLocation(shaderProgram, "dofEnabled");
+    GLint timeOfDayLoc = glGetUniformLocation(shaderProgram, "uTimeOfday");
 
     float dofQuadVerts[6 * 7] = {
         -1.0f, -1.0f, 0.0f,  0.0f, 0.0f,  0.0f, 9.0f,
@@ -2499,16 +2695,8 @@ int main(){
 
     glm_vec3_normalize(sunDir);
 
-    InitializeCriticalSection(&chunkLock);
-    InitializeCriticalSection(&lodLock);
-    InitializeConditionVariable(&chunkWorkReady);
-
     printf("locks made\n");
     fflush(stdout);
-
-    HANDLE workerHandle = CreateThread(NULL, 0, backgroundChunkWorker, NULL, 0, NULL);
-
-    printf("the worker thread(s) have been initialized\n");
 
     glUseProgram(shaderProgram);
 
@@ -2535,6 +2723,26 @@ int main(){
     glBindVertexArray(0);
 
     float ch = 0.02f;
+
+    static float tod = 0.25f;
+
+#if defined(_WIN32) || defined(_WIN64)
+    workerHandle = CreateThread(NULL, 0, backgroundChunkWorker, NULL, 0, NULL);
+        
+    if (!workerHandle) {
+        printf("ERROR: failed to create worker...\n");
+        return -1;
+    }
+
+    SetThreadPriority(workerHandle, THREAD_PRIORITY_BELOW_NORMAL);
+#else
+    if (pthread_create(&workerHandle, NULL, backgroundChunkWorker, NULL) != 0) {
+        printf("ERROR: failed to create worker...\n");
+        return -1;
+    }
+#endif
+
+    printf("the worker thread(s) have been initialized\n");
 
     printf("entering main loop...\n");
     printf("END OF STARTUP INITIALIZATION\n");
@@ -2565,6 +2773,17 @@ int main(){
             0.0f, ch, 0.0f, 0.0f, 0.0f, 0.0f, 6.0f
         };
 
+        tod += deltaTime * 0.005f;
+
+        if (tod > 1.0f) tod -= 1.0f;
+
+        float sunAngle = tod * 1.0f * PI;
+        float dayFactor = fmaxf(sinf(sunAngle), 0.0f);
+        float duskFactor = fmaxf(1.0f - fabsf(sinf(sunAngle)) * 2.0f, 0.0f);
+        float skyR = 0.01f + 0.19f * dayFactor + 0.59f * duskFactor;
+        float skyG = 0.01f + 0.29f * dayFactor + 0.24f * duskFactor;
+        float skyB = 0.05f + 0.25f * dayFactor + 0.05f * duskFactor;
+
         processInput(window, deltaTime);
 
         glm_perspective(glm_rad(cfov), aspect, 0.1f, 800.0f, projection);
@@ -2592,12 +2811,11 @@ int main(){
 
         glUseProgram(shaderProgram);
 
-        if (toggleDof) {
-            ensureDofFramebuffer(widths, heights);
-            glBindFramebuffer(GL_FRAMEBUFFER, dofFbo);
-        }
+        ensureDofFramebuffer(widths, heights);
+        glBindFramebuffer(GL_FRAMEBUFFER, dofFbo);
 
-        glClearColor(0.2f, 0.3f, 0.3f, 1.0f);
+
+        glClearColor(skyR, skyG, skyB, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
         glUniformMatrix4fv(modelLoc, 1, GL_FALSE, (float *)model);
@@ -2607,6 +2825,10 @@ int main(){
         glUniform3fv(sunDirLoc, 1, sunDir);
 
         glUniform3f(camPosLoc, camX, camY, camZ);
+
+        glUniform1i(dofOnLoc, toggleDof ? 1 : 0);
+
+        glUniform1f(timeOfDayLoc, tod);
 
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D_ARRAY, blockTextures);
@@ -2623,18 +2845,18 @@ int main(){
         int preloadRad = renderRad + 1;
         int preloaded = 0;
 
-        EnterCriticalSection(&chunkLock);
+        MUTEX_LOCK(&chunkLock);
 
         for (int cx = camChunkX - preloadRad; cx <= camChunkX + preloadRad && preloaded < 2; cx++) {
             for (int cy = camChunkY - preloadRad; cy <= camChunkY + preloadRad && preloaded < 2; cy++) {
                 for (int cz = camChunkZ - preloadRad; cz <= camChunkZ + preloadRad && preloaded < 2; cz++) {
                     if (!getChunkSilentUnlocked(cx, cy, cz)) {
 
-                        LeaveCriticalSection(&chunkLock);
+                        MUTEX_UNLOCK(&chunkLock);
 
                         getOrCreateChunk(cx, cy, cz);
 
-                        EnterCriticalSection(&chunkLock);
+                        MUTEX_LOCK(&chunkLock);
 
                         preloaded++;
                     }
@@ -2753,7 +2975,7 @@ int main(){
             }       
         }
 
-        LeaveCriticalSection(&chunkLock);
+        MUTEX_UNLOCK(&chunkLock);
 
         for (int i = 0; i < pendingCount; i++) {
             pendingUpload* u = &pendingUploads[i];
@@ -2768,21 +2990,25 @@ int main(){
             free(u->inds);
         }
 
-        EnterCriticalSection(&chunkLock);
+        MUTEX_LOCK(&chunkLock);
 
         for (int cx = camChunkX - renderRad; cx <= camChunkX + renderRad; cx++) {
             for (int cy = camChunkY - renderRad; cy <= camChunkY + renderRad; cy++) {
                 for (int cz = camChunkZ - renderRad; cz <= camChunkZ + renderRad; cz++) { 
+                    chunks* chunk = getChunkSilentUnlocked(cx, cy, cz);
+                    if (!chunk) continue;
+
                     float wx = (float)(cx * chunkSize);
                     float wy = (float)(cy * chunkSize);
                     float wz = (float)(cz * chunkSize);
 
                     if (!aabbFrustum(frustumPlanes, wx, wy, wz, wx + chunkSize, wy + chunkSize, wz + chunkSize)) {
+                        chunk->wasVisible = false;
+
                         continue;
                     }
 
-                    chunks* chunk = getChunkSilentUnlocked(cx, cy, cz);
-                    if (!chunk) continue;
+                    chunk->wasVisible = true;
 
                     int localIdxCount = 0;
                     int localFirstIndx = 0;
@@ -2796,6 +3022,8 @@ int main(){
                         localBaseVertex = chunk->mesh->baseVertex;
                         validMesh = true;
                     }
+
+                    chunk->wasVisible = true;
 
                     if (validMesh) {
                         float distToCam = sqrtf((wx - camX) * (wx - camX) + (wy - camY) * (wy - camY) + (wz - camZ) * (wz - camZ));
@@ -2812,7 +3040,7 @@ int main(){
 
                             if (globalCommandCount >= maxDrawCommands) {
 
-                                LeaveCriticalSection(&chunkLock);
+                                MUTEX_UNLOCK(&chunkLock);
 
                                 glBindBuffer(GL_DRAW_INDIRECT_BUFFER, masterIndirectBuffer);
                                 glBufferData(GL_DRAW_INDIRECT_BUFFER, maxDrawCommands * sizeof(drawElementsIndirectCommand), NULL, GL_STREAM_DRAW);
@@ -2821,7 +3049,7 @@ int main(){
 
                                 globalCommandCount = 0;
 
-                                EnterCriticalSection(&chunkLock);
+                                MUTEX_LOCK(&chunkLock);
                             }
                         }
                     }
@@ -2829,7 +3057,7 @@ int main(){
             }
         }
 
-        LeaveCriticalSection(&chunkLock);
+        MUTEX_UNLOCK(&chunkLock);
 
         int drawnIndices = 0;
 
@@ -2922,7 +3150,7 @@ int main(){
 
                             LeaveCriticalSection(&lodLock);
 
-                            WakeConditionVariable(&chunkWorkReady);
+                            COND_SIGNAL(&chunkWorkReady);
                         }
 
                         continue;
@@ -3005,31 +3233,35 @@ int main(){
             glBindVertexArray(0);
         }
 
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glDisable(GL_DEPTH_TEST);
+        glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+
+        glUseProgram(shaderProgram);
+        glActiveTexture(GL_TEXTURE1);
+
+        glBindTexture(GL_TEXTURE_2D, dofColorTex);
+        glUniform1i(dofColorTexLoc, 1);
+
+        glActiveTexture(GL_TEXTURE2);
+        glBindTexture(GL_TEXTURE_2D, dofDepthTex);
+        glUniform1i(dofDepthTexLoc, 2);
+
+        glUniform1f(dofNearLoc, 0.1f);
+        glUniform1f(dofFarLoc, 800.0f);
+
         if (toggleDof) {
-            glBindFramebuffer(GL_FRAMEBUFFER, 0);
-            glDisable(GL_DEPTH_TEST);
-            glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
-
-            glUseProgram(shaderProgram);
-            glActiveTexture(GL_TEXTURE1);
-
-            glBindTexture(GL_TEXTURE_2D, dofColorTex);
-            glUniform1i(dofColorTexLoc, 1);
-
-            glActiveTexture(GL_TEXTURE2);
-            glBindTexture(GL_TEXTURE_2D, dofDepthTex);
-            glUniform1i(dofDepthTexLoc, 2);
-
-            glUniform1f(dofNearLoc, 0.1f);
-            glUniform1f(dofFarLoc, 800.0f);
             glUniform1f(dofFocusDistLoc, 25.0f);
-
-            glBindVertexArray(dofVao);
-            glDrawArrays(GL_TRIANGLES, 0, 6);
-            glBindVertexArray(0);
-
-            glEnable(GL_DEPTH_TEST);
+        } else {
+            glUniform1f(dofFocusDistLoc, 1000.0f);
         }
+
+        glBindVertexArray(dofVao);
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+        glBindVertexArray(0);
+
+
+        glEnable(GL_DEPTH_TEST);
 
         glfwSwapBuffers(window);
         glfwPollEvents();
@@ -3037,9 +3269,21 @@ int main(){
 
     printf("EXIT: i will signal worker\n");
     fflush(stdout);
-    InterlockedExchange(&isRunning, 0);
-    WaitForSingleObject(workerHandle, INFINITE);
-    CloseHandle(workerHandle);
+
+    ATOMIC_SET(isRunning, 0);
+
+    COND_SIGNAL(&chunkWorkReady);
+
+    #if defined(_WIN32) || defined(_WIN64)
+        WaitForSingleObject(workerHandle, INFINITE);
+        CloseHandle(workerHandle);
+    #else
+        MUTEX_LOCK(&chunkLock);
+        pthread_cond_broadcast(&chunkWorkReady);
+        MUTEX_UNLOCK(&chunkLock);
+        pthread_join(workerHandle, NULL);
+    #endif
+
     printf("EXIT: worker stopped\n");
     fflush(stdout);
 
@@ -3105,8 +3349,10 @@ int main(){
     printf("EXIT: the lod tiles are gone\n");
     fflush(stdout);
 
-    DeleteCriticalSection(&chunkLock);
-    DeleteCriticalSection(&lodLock);
+    MUTEX_DESTROY(&chunkLock);
+    MUTEX_UNLOCK(&lodLock);
+    COND_DESTROY(&chunkWorkReady);
+
     glfwDestroyWindow(window);
     glfwTerminate();
     printf("EXIT: the exit was clean\n");
