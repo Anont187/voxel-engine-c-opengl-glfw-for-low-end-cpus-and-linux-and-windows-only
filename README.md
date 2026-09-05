@@ -1,6 +1,8 @@
 # voxel-engine-c-opengl-glfw-for-low-end-cpus-and-windows-only
 This is a voxel engine with optimizations. For windows only.
 
+NOW ARCHIVED
+
 This is an optimized voxel engine, more optimizations coming soon.
 It also squeezes the performance out of low-end pc's.
 
